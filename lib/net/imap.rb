@@ -4227,6 +4227,7 @@ require_relative "imap/command_data"
 require_relative "imap/data_encoding"
 require_relative "imap/flags"
 require_relative "imap/response_data"
+require_relative "imap/rename_planner"
 require_relative "imap/response_parser"
 require_relative "imap/authenticators"
 
