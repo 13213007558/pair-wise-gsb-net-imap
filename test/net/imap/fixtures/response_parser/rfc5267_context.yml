@@ -1,0 +1,76 @@
+---
+:tests:
+
+  "RFC5267 ESEARCH ADDTO update":
+    :response: "* ESEARCH (TAG \"A283\") UID ADDTO 2:9,5:14\r\n"
+    :expected: !ruby/struct:Net::IMAP::UntaggedResponse
+      name: ESEARCH
+      data: !ruby/data:Net::IMAP::ESearchResult
+        tag: A283
+        uid: true
+        data:
+        - - ADDTO
+          - !ruby/data:Net::IMAP::ESearchResult::AddTo
+            pairs:
+            - [2, 9]
+            - [5, 14]
+      raw_data: "* ESEARCH (TAG \"A283\") UID ADDTO 2:9,5:14\r\n"
+
+  "RFC5267 ESEARCH REMOVEFROM update":
+    :response: "* ESEARCH (TAG \"A283\") UID REMOVEFROM 3,7\r\n"
+    :expected: !ruby/struct:Net::IMAP::UntaggedResponse
+      name: ESEARCH
+      data: !ruby/data:Net::IMAP::ESearchResult
+        tag: A283
+        uid: true
+        data:
+        - - REMOVEFROM
+          - !ruby/data:Net::IMAP::ESearchResult::RemoveFrom
+            positions: !ruby/object:Net::IMAP::SequenceSet
+              string: "3,7"
+      raw_data: "* ESEARCH (TAG \"A283\") UID REMOVEFROM 3,7\r\n"
+
+  "RFC5267 ESEARCH with multiple updates in one response":
+    :response: "* ESEARCH (TAG \"A284\") ADDTO 1:100 REMOVEFROM 2,4 ADDTO 3:200\r\n"
+    :expected: !ruby/struct:Net::IMAP::UntaggedResponse
+      name: ESEARCH
+      data: !ruby/data:Net::IMAP::ESearchResult
+        tag: A284
+        uid: false
+        data:
+        - - ADDTO
+          - !ruby/data:Net::IMAP::ESearchResult::AddTo
+            pairs:
+            - [1, 100]
+        - - REMOVEFROM
+          - !ruby/data:Net::IMAP::ESearchResult::RemoveFrom
+            positions: !ruby/object:Net::IMAP::SequenceSet
+              string: "2,4"
+        - - ADDTO
+          - !ruby/data:Net::IMAP::ESearchResult::AddTo
+            pairs:
+            - [3, 200]
+      raw_data: "* ESEARCH (TAG \"A284\") ADDTO 1:100 REMOVEFROM 2,4 ADDTO 3:200\r\n"
+
+  "RFC5267 NOUPDATE resp-text-code, untagged":
+    :response: "* OK [NOUPDATE A283] Search context will not be updated\r\n"
+    :expected: !ruby/struct:Net::IMAP::UntaggedResponse
+      name: OK
+      data: !ruby/struct:Net::IMAP::ResponseText
+        code: !ruby/struct:Net::IMAP::ResponseCode
+          name: NOUPDATE
+          data: A283
+        text: Search context will not be updated
+      raw_data: "* OK [NOUPDATE A283] Search context will not be updated\r\n"
+
+  "RFC5267 NOUPDATE resp-text-code, tagged":
+    :response: "A283 OK [NOUPDATE A283] Search completed\r\n"
+    :expected: !ruby/struct:Net::IMAP::TaggedResponse
+      tag: A283
+      name: OK
+      data: !ruby/struct:Net::IMAP::ResponseText
+        code: !ruby/struct:Net::IMAP::ResponseCode
+          name: NOUPDATE
+          data: A283
+        text: Search completed
+      raw_data: "A283 OK [NOUPDATE A283] Search completed\r\n"

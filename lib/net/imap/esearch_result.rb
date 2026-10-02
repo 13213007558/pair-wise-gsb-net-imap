@@ -24,7 +24,10 @@ module Net
     #
     # Some search extensions may result in the server sending ESearchResult
     # responses after the initiating command has completed.  Use
-    # IMAP#add_response_handler to handle these responses.
+    # IMAP#add_response_handler to handle these responses, or
+    # IMAP#search_contexts to apply <tt>CONTEXT=SEARCH</tt> and
+    # <tt>CONTEXT=SORT</tt> {[RFC5267]}[https://www.rfc-editor.org/rfc/rfc5267.html]
+    # updates to a SearchContext automatically.
     #
     # ==== Compatibility with SearchResult
     #
@@ -219,6 +222,128 @@ module Net
       #
       # See also: #to_a
       def partial;    data.assoc("PARTIAL")&.last    end
+
+      # Returned by ESearchResult#addto.
+      #
+      # Requires <tt>CONTEXT=SEARCH</tt> or <tt>CONTEXT=SORT</tt>
+      # {[RFC5267]}[https://www.rfc-editor.org/rfc/rfc5267.html#section-4.3]
+      #
+      # See also: SearchContext
+      class AddTo < Data.define(:pairs)
+        def initialize(pairs:)
+          pairs = pairs.map {|pair| pair.map { Integer(_1) }.freeze }.freeze
+          super
+        end
+
+        ##
+        # :method: pairs
+        # :call-seq: pairs -> array of [position, message] pairs
+        #
+        # Each pair contains the 1-based position in the search context
+        # result at which a message was added, and the message sequence
+        # number or UID of the added message.  Pairs are applied in order,
+        # and each position refers to the result after all preceding pairs
+        # (and all preceding updates in the same response) have been
+        # applied.
+
+        # Yields each <tt>[position, message]</tt> pair, in order.
+        def each_pair(&) = pairs.each(&)
+      end
+
+      # Returned by ESearchResult#removefrom.
+      #
+      # Requires <tt>CONTEXT=SEARCH</tt> or <tt>CONTEXT=SORT</tt>
+      # {[RFC5267]}[https://www.rfc-editor.org/rfc/rfc5267.html#section-4.3]
+      #
+      # See also: SearchContext
+      class RemoveFrom < Data.define(:positions)
+        def initialize(positions:)
+          positions = SequenceSet[positions]
+          super
+        end
+
+        ##
+        # :method: positions
+        # :call-seq: positions -> sequence set
+        #
+        # The 1-based positions, in the current search context result, of
+        # the messages that were removed.  All positions refer to the result
+        # as it was before this +REMOVEFROM+ data is applied (but after any
+        # preceding updates in the same response).
+
+        # Yields each removed position, in sorted order.
+        def each_position(&) = positions.each_number(&)
+      end
+
+      # :call-seq: addto -> array of [position, message] pairs
+      #
+      # Flattens every +ADDTO+ return data item into a single array of
+      # <tt>[position, message]</tt> pairs.  Returns an empty array when the
+      # response contains no +ADDTO+ data.
+      #
+      # *Note:* when a response contains both +ADDTO+ and +REMOVEFROM+ data,
+      # the relative order between them is significant.  Use #each_update
+      # (or SearchContext#update) to apply updates in order.
+      #
+      # Requires <tt>CONTEXT=SEARCH</tt> or <tt>CONTEXT=SORT</tt>
+      # {[RFC5267]}[https://www.rfc-editor.org/rfc/rfc5267.html#section-4.3]
+      def addto
+        data.select { _1 in ["ADDTO", AddTo] }.flat_map { _1.last.pairs }
+      end
+
+      # :call-seq: removefrom -> array of positions
+      #
+      # Flattens every +REMOVEFROM+ return data item into a single array of
+      # 1-based result positions.  Returns an empty array when the response
+      # contains no +REMOVEFROM+ data.
+      #
+      # *Note:* when a response contains both +ADDTO+ and +REMOVEFROM+ data,
+      # the relative order between them is significant.  Use #each_update
+      # (or SearchContext#update) to apply updates in order.
+      #
+      # Requires <tt>CONTEXT=SEARCH</tt> or <tt>CONTEXT=SORT</tt>
+      # {[RFC5267]}[https://www.rfc-editor.org/rfc/rfc5267.html#section-4.3]
+      def removefrom
+        data.select { _1 in ["REMOVEFROM", RemoveFrom] }
+            .flat_map { _1.last.positions.numbers }
+      end
+
+      # :call-seq:
+      #   each_update {|update| ... } -> self
+      #   each_update -> enumerator
+      #
+      # Yields each +ADDTO+ or +REMOVEFROM+ update, in the order the updates
+      # appear in the response.  +ADDTO+ pairs are yielded as
+      # <tt>[:addto, position, message]</tt> and +REMOVEFROM+ positions are
+      # yielded as <tt>[:removefrom, position]</tt>.
+      #
+      # Requires <tt>CONTEXT=SEARCH</tt> or <tt>CONTEXT=SORT</tt>
+      # {[RFC5267]}[https://www.rfc-editor.org/rfc/rfc5267.html#section-4.3]
+      #
+      # See also: SearchContext#update
+      def each_update
+        return to_enum(__callee__) unless block_given?
+        data.each do |name, value|
+          case name
+          when "ADDTO"
+            value.each_pair { |position, message|
+              yield :addto, position, message
+            }
+          when "REMOVEFROM"
+            value.each_position { |position|
+              yield :removefrom, position
+            }
+          end
+        end
+        self
+      end
+
+      # Whether the response contains any +ADDTO+ or +REMOVEFROM+ updates to
+      # a <tt>CONTEXT=SEARCH</tt> or <tt>CONTEXT=SORT</tt> search context
+      # {[RFC5267]}[https://www.rfc-editor.org/rfc/rfc5267.html#section-4.3].
+      def updates?
+        data.any? { _1 in ["ADDTO" | "REMOVEFROM", _] }
+      end
 
     end
   end

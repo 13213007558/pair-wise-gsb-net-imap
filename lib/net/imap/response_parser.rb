@@ -1566,9 +1566,34 @@ module Net
           when "COUNT"      then number
           when "MODSEQ"     then mod_sequence_value         # RFC7162: CONDSTORE
           when "PARTIAL"    then ret_data_partial__value    # RFC9394: PARTIAL
+          when "ADDTO"      then ret_data_addto__value      # RFC5267: CONTEXT
+          when "REMOVEFROM" then ret_data_removefrom__value # RFC5267: CONTEXT
           else search_return_value
           end
         [label, value]
+      end
+
+      # From RFC5267 (CONTEXT=SEARCH, CONTEXT=SORT):
+      #   ret-data-addto    = "ADDTO" SP sequence-set
+      #     ;; Each seq-range "position:message" pair gives the 1-based
+      #     ;; position in the result at which a message was added, and the
+      #     ;; message sequence number or UID of the added message.
+      def ret_data_addto__value
+        pairs = sequence_set.each_entry.map {|entry|
+          case entry
+          when Range then [entry.begin, entry.end]
+          else            [entry, entry]
+          end
+        }
+        ESearchResult::AddTo.new(pairs: pairs)
+      end
+
+      # From RFC5267 (CONTEXT=SEARCH, CONTEXT=SORT):
+      #   ret-data-removefrom = "REMOVEFROM" SP sequence-set
+      #     ;; Each number is the 1-based position, in the current result,
+      #     ;; of a message that was removed from the result.
+      def ret_data_removefrom__value
+        ESearchResult::RemoveFrom.new(positions: sequence_set)
       end
 
       # From RFC5267 (CONTEXT=SEARCH, CONTEXT=SORT) and RFC9394 (PARTIAL):
@@ -1985,6 +2010,7 @@ module Net
           when "HIGHESTMODSEQ"      then SP!; mod_sequence_value   # CONDSTORE
           when "MODIFIED"           then SP!; sequence_set         # CONDSTORE
           when "MAILBOXID"          then SP!; parens__objectid     # RFC8474: OBJECTID
+          when "NOUPDATE"           then SP!; resp_code__noupdate__tag
           when "UIDREQUIRED"        then                           # RFC9586: UIDONLY
           else
             state = nil # don't backtrack
@@ -2007,6 +2033,15 @@ module Net
       # 1*<any TEXT-CHAR except "]">
       def text_chars_except_rbra
         match_re(CTEXT_REGEXP, '1*<any TEXT-CHAR except "]">')[0]
+      end
+
+      # RFC5267 (CONTEXT=SEARCH, CONTEXT=SORT):
+      #   resp-text-code =/ "NOUPDATE" SP tag
+      #     ;; The tag of the command that created the search context which
+      #     ;; will not be updated.  Parsed as an atom (or string), so the
+      #     ;; "]" that terminates the resp-text-code is not consumed.
+      def resp_code__noupdate__tag
+        lookahead?(T_QUOTED, T_LITERAL) ? string : atom
       end
 
       # "(" charset *(SP charset) ")"

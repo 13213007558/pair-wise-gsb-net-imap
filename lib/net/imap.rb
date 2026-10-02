@@ -953,6 +953,8 @@ module Net
     autoload :SASLAdapter,            "#{dir}/sasl_adapter"
     autoload :SequenceSet,            "#{dir}/sequence_set"
     autoload :StringPrep,             "#{dir}/stringprep"
+    autoload :SearchContext,          "#{dir}/search_context"
+    autoload :SearchContextTracker,   "#{dir}/search_context_tracker"
 
     include MonitorMixin
 
@@ -1255,6 +1257,7 @@ module Net
       @parser = ResponseParser.new(config: @config)
       @responses = Hash.new {|h, k| h[k] = [] }
       @response_handlers = []
+      @search_context_tracker = SearchContextTracker.new(self)
       @receiver_thread = nil
       @receiver_thread_exception = nil
       @receiver_thread_terminating = false
@@ -2841,6 +2844,29 @@ module Net
       search_internal("UID SEARCH", ...)
     end
 
+    # Sends a {CANCELUPDATE command [RFC5267 §4.5]}[https://www.rfc-editor.org/rfc/rfc5267#section-4.5]
+    # to cancel server updates for one or more search contexts, identified
+    # by the correlator tags of the commands that created them.
+    #
+    #   imap.cancelupdate("RUBY0001", "RUBY0002")
+    #
+    # When the contexts are tracked by #search_contexts, prefer
+    # SearchContextTracker#cancel, which also updates each tracked
+    # SearchContext to SearchContext#cancelled?.
+    #
+    # Related: #search_contexts, #search, #uid_search, #sort, #uid_sort
+    #
+    # ==== Capabilities
+    #
+    # The server's capabilities must include either <tt>CONTEXT=SEARCH</tt>
+    # or <tt>CONTEXT=SORT</tt>
+    # [RFC5267[https://www.rfc-editor.org/rfc/rfc5267.html]].
+    def cancelupdate(*tags)
+      tags = tags.flatten
+      tags.empty? and raise ArgumentError, "missing search context tags"
+      send_command("CANCELUPDATE", *tags)
+    end
+
     # :call-seq:
     #   fetch(set, attr, changedsince: nil) -> array of FetchData
     #
@@ -3143,12 +3169,19 @@ module Net
     #   p imap.sort(["DATE"], ["SUBJECT", "hello"], "US-ASCII")
     #   #=> [6, 7, 8, 1]
     #
+    # When +return+ options are specified, the server must support the
+    # +ESORT+ or <tt>CONTEXT=SORT</tt> extension
+    # {[RFC5267]}[https://www.rfc-editor.org/rfc/rfc5267.html#section-3],
+    # and an ESearchResult is returned.  See #search for documentation of
+    # +return+ options.
+    #
     # ==== Capabilities
     #
     # The server's capabilities must include +SORT+
     # [RFC5256[https://www.rfc-editor.org/rfc/rfc5256]].
-    def sort(sort_keys, search_keys, charset)
-      return sort_internal("SORT", sort_keys, search_keys, charset)
+    def sort(sort_keys, search_keys, charset, return: nil)
+      {return:} => {return: return_opts}
+      sort_internal("SORT", sort_keys, search_keys, charset, return_opts)
     end
 
     # Sends a {UID SORT command [RFC5256 §3]}[https://www.rfc-editor.org/rfc/rfc5256#section-3]
@@ -3160,12 +3193,19 @@ module Net
     #
     # Related: #sort, #search, #uid_search, #thread, #uid_thread
     #
+    # When +return+ options are specified, the server must support the
+    # +ESORT+ or <tt>CONTEXT=SORT</tt> extension
+    # {[RFC5267]}[https://www.rfc-editor.org/rfc/rfc5267.html#section-3],
+    # and an ESearchResult is returned.  See #search for documentation of
+    # +return+ options.
+    #
     # ==== Capabilities
     #
     # The server's capabilities must include +SORT+
     # [RFC5256[https://www.rfc-editor.org/rfc/rfc5256]].
-    def uid_sort(sort_keys, search_keys, charset)
-      return sort_internal("UID SORT", sort_keys, search_keys, charset)
+    def uid_sort(sort_keys, search_keys, charset, return: nil)
+      {return:} => {return: return_opts}
+      sort_internal("UID SORT", sort_keys, search_keys, charset, return_opts)
     end
 
     # Sends a {THREAD command [RFC5256 §3]}[https://www.rfc-editor.org/rfc/rfc5256#section-3]
@@ -3563,6 +3603,27 @@ module Net
       end
     end
 
+    # Returns the SearchContextTracker for this connection, creating it if
+    # necessary.  The tracker routes untagged +ESEARCH+ updates
+    # {[RFC5267]}[https://www.rfc-editor.org/rfc/rfc5267.html] to their
+    # SearchContext, keyed by each context's correlator tag.
+    #
+    #   result  = imap.uid_search(["FLAGGED"], return: [:PARTIAL, 1..100])
+    #   context = imap.search_contexts.track(result)
+    #   # ... server sends updates as the result changes:
+    #   context.to_a # => the current ordered result
+    #
+    # Related: #cancelupdate, #search, #uid_search, #sort, #uid_sort
+    #
+    # ==== Capabilities
+    #
+    # The server's capabilities must include either <tt>CONTEXT=SEARCH</tt>
+    # or <tt>CONTEXT=SORT</tt>
+    # [RFC5267[https://www.rfc-editor.org/rfc/rfc5267.html]].
+    def search_contexts
+      synchronize { @search_context_tracker ||= SearchContextTracker.new(self) }
+    end
+
     # :call-seq:
     #   clear_responses       -> hash
     #   clear_responses(type) -> array
@@ -3777,6 +3838,7 @@ module Net
           @continuation_request_arrival.signal
         end
         state_unselected! if resp in {data: {code: {name: "CLOSED"}}}
+        @search_context_tracker&.call(resp)
         @response_handlers.each do |handler|
           handler.call(resp)
         end
@@ -4094,11 +4156,24 @@ module Net
       send_command(cmd, SequenceSet.new(set), mailbox)
     end
 
-    def sort_internal(cmd, sort_keys, search_keys, charset)
+    def sort_internal(cmd, sort_keys, search_keys, charset, return_opts = nil)
       search_keys = normalize_searching_criteria(search_keys)
       synchronize do
-        send_command(cmd, sort_keys, charset, *search_keys)
-        clear_responses("SORT").last || []
+        if return_opts
+          return_opts = convert_return_opts(return_opts)
+          tagged = send_command(cmd, "RETURN", return_opts,
+                                sort_keys, charset, *search_keys)
+          tag    = tagged.tag
+          # Only the last ESEARCH or SORT is used.  Excesses are ignored.
+          esearch = extract_responses("ESEARCH") {|response|
+            response in ESearchResult(tag: ^tag)
+          }.last
+          sort    = clear_responses("SORT").last
+          esearch || sort || ESearchResult[tag:, uid: cmd.start_with?("UID ")]
+        else
+          send_command(cmd, sort_keys, charset, *search_keys)
+          clear_responses("SORT").last || []
+        end
       end
     end
 
@@ -4170,6 +4245,9 @@ module Net
     def state_authenticated!(resp = nil)
       synchronize do
         @capabilities = capabilities_from_resp_code resp if resp
+        # leaving the selected state implicitly destroys all search contexts
+        @search_context_tracker&.close_all! if
+          @connection_state.to_sym == :selected
         @connection_state = ConnectionState::Authenticated.new
       end
     end
@@ -4190,6 +4268,7 @@ module Net
       return true if connection_state in [:logout, *]
       synchronize do
         return true if connection_state in [:logout, *]
+        @search_context_tracker&.close_all!
         @connection_state = ConnectionState::Logout.new
       end
     end

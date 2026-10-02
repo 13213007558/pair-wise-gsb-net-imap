@@ -96,6 +96,9 @@ class ResponseParserTest < Net::IMAP::TestCase
   # RFC 9394: PARTIAL extension
   generate_tests_from fixture_file: "rfc9394_partial.yml"
 
+  # RFC 5267: CONTEXT=SEARCH / CONTEXT=SORT
+  generate_tests_from fixture_file: "rfc5267_context.yml"
+
   # RFC 9586: UIDONLY extension
   generate_tests_from fixture_file: "rfc9586_uidonly_responses.yml"
 

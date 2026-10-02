@@ -132,4 +132,31 @@ class ESearchResultTest < Net::IMAP::TestCase
     )
   end
 
+  test "#addto and #removefrom (RFC5267: CONTEXT=SEARCH/CONTEXT=SORT)" do
+    result = Net::IMAP::ResponseParser.new.parse(
+      '* ESEARCH (TAG "A0007") UID ADDTO 2:9,5:14 REMOVEFROM 3,7' + "\r\n"
+    ).data
+    assert_equal [[2, 9], [5, 14]], result.addto
+    assert_equal [3, 7],             result.removefrom
+    assert result.updates?
+
+    result = Net::IMAP::ResponseParser.new.parse(
+      '* ESEARCH (TAG "A0008") UID COUNT 3' + "\r\n"
+    ).data
+    assert_equal [], result.addto
+    assert_equal [], result.removefrom
+    refute result.updates?
+  end
+
+  test "#each_update yields ADDTO and REMOVEFROM in order" do
+    result = Net::IMAP::ResponseParser.new.parse(
+      '* ESEARCH (TAG "A0009") UID ADDTO 2:9 REMOVEFROM 3 ADDTO 5:14' + "\r\n"
+    ).data
+    assert_kind_of Enumerator, result.each_update
+    assert_equal(
+      [[:addto, 2, 9], [:removefrom, 3], [:addto, 5, 14]],
+      result.each_update.to_a
+    )
+  end
+
 end
