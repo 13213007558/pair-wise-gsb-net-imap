@@ -948,6 +948,7 @@ module Net
 
     dir = File.expand_path("imap", __dir__)
     autoload :ConnectionState,        "#{dir}/connection_state"
+    autoload :RawDeflateIO,           "#{dir}/raw_deflate_io"
     autoload :ResponseReader,         "#{dir}/response_reader"
     autoload :SASL,                   "#{dir}/sasl"
     autoload :SASLAdapter,            "#{dir}/sasl_adapter"
@@ -1249,6 +1250,7 @@ module Net
       @capabilities = nil
       @enabled = Set.new
       @tls_connected = @tls_verified = false
+      @compressing = false
       @connection_state = ConnectionState::NotAuthenticated.new
 
       # Client Protocol Receiver
@@ -1342,7 +1344,10 @@ module Net
     # This only indicates that TLS negotiation has started.
     #
     # See #tls_verified?
-    def tls_socket?; @sock.kind_of?(OpenSSL::SSL::SSLSocket) end
+    def tls_socket?
+      sock = compressing? ? @sock.io : @sock
+      sock.kind_of?(OpenSSL::SSL::SSLSocket)
+    end
 
     # Disconnects from the server.
     #
@@ -1637,6 +1642,47 @@ module Net
       end
       ok
     end
+
+    # Sends a {COMPRESS command [RFC4978 §2]}[https://www.rfc-editor.org/rfc/rfc4978#section-2]
+    # to enable compression of all subsequent commands and responses.
+    # Requires that the server advertises the +COMPRESS=DEFLATE+ capability.
+    #
+    # After the server responds with a tagged +OK+ response, both the commands
+    # sent by the client and the responses sent by the server are compressed,
+    # each as its own continuous raw deflate stream (see RFC1951).  Compression
+    # cannot be disabled for the rest of the connection.
+    #
+    # The command is only sent when no other commands are in progress, and
+    # decompression is enabled by the receiver thread itself, immediately after
+    # the tagged +OK+ response has been read.  Any compressed bytes that were
+    # already received along with that response are handed to the decompressor.
+    #
+    # When the server refuses to enable compression, the original
+    # NoResponseError or BadResponseError is raised.  Corrupted compressed
+    # data or a prematurely closed connection will raise the original
+    # Zlib::Error or EOFError from the receiver thread.
+    #
+    # Related: #compressing?, #capabilities, #capable?
+    #
+    # ==== Capability
+    #
+    # The server's capabilities must include +COMPRESS=DEFLATE+
+    # [RFC4978[https://www.rfc-editor.org/rfc/rfc4978.html]].
+    def compress
+      unless capable?("COMPRESS=DEFLATE")
+        raise DataFormatError, "Server does not support COMPRESS=DEFLATE"
+      end
+      synchronize do
+        send_command("COMPRESS", "DEFLATE") do |resp|
+          if resp.kind_of?(TaggedResponse) && resp.name == "OK"
+            start_compressing
+          end
+        end
+      end
+    end
+
+    # Returns whether compression has been enabled by #compress.
+    def compressing?; @compressing end
 
     # :call-seq:
     #   authenticate(mechanism, *, sasl_ir: config.sasl_ir, registry: Net::IMAP::SASL.authenticators, **, &) -> ok_resp
@@ -4149,6 +4195,17 @@ module Net
       else
         false
       end
+    end
+
+    # Called by the receiver thread, from the COMPRESS tagged OK handler, so
+    # the swap happens at a safe boundary: no commands are outstanding and no
+    # response is being read.  The same IO object is wrapped (not replaced), so
+    # compressed bytes that were already buffered after the tagged OK are
+    # still routed through the new decompressor.
+    def start_compressing
+      @sock = RawDeflateIO.new(@sock)
+      @reader = ResponseReader.new(self, @sock)
+      @compressing = true
     end
 
     def start_tls_session
