@@ -77,6 +77,12 @@ class Net::IMAP::FakeServer
       state.use_tls
     end
 
+    on "COMPRESS" do |resp|
+      resp.args == "DEFLATE" or return resp.fail_no "unsupported algorithm"
+      resp.done_ok
+      state.use_deflate
+    end
+
     on "LOGIN" do |resp|
       state.not_authenticated?           or return resp.fail_bad_state(state)
       args = resp.command.args

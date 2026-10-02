@@ -45,6 +45,7 @@ class Net::IMAP::FakeServer
 
     def tls?;    @socket.tls?    end
     def use_tls; @socket.use_tls end
+    def use_deflate; @socket.use_deflate end
     def closed?; @socket.closed? end
 
     def name

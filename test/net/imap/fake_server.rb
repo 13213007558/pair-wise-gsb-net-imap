@@ -39,6 +39,7 @@ class Net::IMAP::FakeServer
   autoload :Configuration,         "#{dir}/configuration"
   autoload :Connection,            "#{dir}/connection"
   autoload :ConnectionState,       "#{dir}/connection_state"
+  autoload :DeflateSocket,         "#{dir}/deflate_socket"
   autoload :ResponseWriter,        "#{dir}/response_writer"
   autoload :Socket,                "#{dir}/socket"
   autoload :Session,               "#{dir}/session"

@@ -30,6 +30,10 @@ class Net::IMAP::FakeServer
       end
     end
 
+    def use_deflate
+      @deflate_socket ||= DeflateSocket.new(socket)
+    end
+
     def close
       @tls_socket&.close unless @tls_socket&.closed?
       @tcp_socket&.close unless @tcp_socket&.closed?
@@ -38,7 +42,7 @@ class Net::IMAP::FakeServer
 
     private
 
-    def socket; @tls_socket || @tcp_socket end
+    def socket; @deflate_socket || @tls_socket || @tcp_socket end
 
     def ssl_ctx
       @ssl_ctx ||= OpenSSL::SSL::SSLContext.new.tap do |ctx|

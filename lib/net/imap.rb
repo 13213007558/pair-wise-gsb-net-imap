@@ -16,6 +16,7 @@
 require "socket"
 require "monitor"
 require 'net/protocol'
+require "zlib"
 begin
   require "openssl"
 rescue LoadError
@@ -480,6 +481,9 @@ module Net
   #   unnecessary commands to the server.</em>
   # - #noop: Allows the server to send unsolicited untagged #responses.
   # - #logout: Tells the server to end the session. Enters the +logout+ state.
+  # - #compress: Enables +DEFLATE+ compression for the connection.
+  #
+  #   <em>Requires the <tt>COMPRESS=DEFLATE</tt> capability.</em>
   #
   # ==== Not Authenticated state
   #
@@ -637,6 +641,9 @@ module Net
   # ==== RFC4959: +SASL-IR+
   # Folded into IMAP4rev2[https://www.rfc-editor.org/rfc/rfc9051].
   # - Updates #authenticate with the option to send an initial response.
+  #
+  # ==== RFC4978: <tt>COMPRESS=DEFLATE</tt>
+  # - #compress: Enables +DEFLATE+ compression for the connection.
   #
   # ==== RFC5161: +ENABLE+
   # Folded into IMAP4rev2[https://www.rfc-editor.org/rfc/rfc9051] and also included
@@ -1636,6 +1643,41 @@ module Net
               ]
       end
       ok
+    end
+
+    # Sends a {COMPRESS command [RFC4978 §3]}[https://www.rfc-editor.org/rfc/rfc4978#section-3]
+    # to enable DEFLATE {[RFC1951]}[https://www.rfc-editor.org/rfc/rfc1951]
+    # compression for the rest of the connection.  Returns the TaggedResponse.
+    #
+    # After the server replies with a tagged +OK+ response, all subsequent
+    # commands and responses are compressed.  Each direction uses its own
+    # continuous +DEFLATE+ stream: the compression state is _not_ reset
+    # between commands or responses.
+    #
+    # Related: #starttls
+    #
+    # ==== Capability
+    #
+    # Clients should not call #compress unless the server advertises the
+    # <tt>COMPRESS=DEFLATE</tt> capability.
+    #
+    # ==== For example:
+    #
+    #   imap.capable?("COMPRESS=DEFLATE") or raise "unsupported"
+    #   imap.compress
+    #
+    def compress
+      send_command("COMPRESS", "DEFLATE") do |resp|
+        if resp.kind_of?(TaggedResponse) && resp.name == "OK"
+          # NOTE: Swapping the socket layers inside the response handler
+          # guarantees that the change happens inside the receiver thread, at
+          # a safe boundary with no outstanding commands.  Any compressed
+          # bytes that were already received along with the tagged OK remain
+          # buffered inside @sock and will be decompressed by the new reader.
+          @reader = ResponseReader.new(self, InflateAdapter.new(@sock))
+          @sock   = DeflateAdapter.new(@sock)
+        end
+      end
     end
 
     # :call-seq:
@@ -4164,6 +4206,82 @@ module Net
       if ssl_ctx.verify_mode != OpenSSL::SSL::VERIFY_NONE
         @sock.post_connection_check(@host)
         @tls_verified = true
+      end
+    end
+
+    # Wraps the connection socket after COMPRESS [RFC4978], compressing
+    # everything written to it.  A single continuous DEFLATE stream [RFC1951]
+    # is used for the remainder of the connection: the stream is flushed after
+    # each write but is never reset or finished.
+    class DeflateAdapter # :nodoc:
+      def initialize(socket)
+        @socket   = socket
+        @deflater = Zlib::Deflate.new(Zlib::DEFAULT_COMPRESSION,
+                                      -Zlib::MAX_WBITS)
+      end
+
+      def print(*strings)
+        @socket.print(@deflater.deflate(strings.join, Zlib::SYNC_FLUSH))
+      end
+
+      def method_missing(...)
+        @socket.__send__(...)
+      end
+
+      def respond_to_missing?(name, include_private = false)
+        @socket.respond_to?(name, include_private)
+      end
+    end
+
+    # Wraps the connection socket after COMPRESS [RFC4978], decompressing
+    # everything read from it.  A single continuous DEFLATE stream [RFC1951]
+    # is used for the remainder of the connection.
+    #
+    # Reads from the same underlying socket object, so any compressed bytes
+    # that were already buffered by the socket (e.g. compressed data that
+    # arrived along with the tagged OK to COMPRESS) are decompressed by this
+    # adapter, and +length+ arguments always count _decompressed_ bytes.
+    class InflateAdapter # :nodoc:
+      def initialize(socket)
+        @socket   = socket
+        @inflater = Zlib::Inflate.new(-Zlib::MAX_WBITS)
+        @buffer   = +"".b
+      end
+
+      # Reads until +separator+, like IO#gets.  Returns at most +limit+ bytes.
+      # Returns +nil+ when the stream is closed before any data is read.
+      def gets(separator, limit = nil)
+        until (index = @buffer.index(separator)) ||
+              (limit && @buffer.bytesize >= limit)
+          fill_buffer or break
+        end
+        length = index ? index + separator.bytesize : @buffer.bytesize
+        length = limit if limit && length > limit
+        line = @buffer.slice!(0, length)
+        line unless line.empty?
+      end
+
+      # Reads up to +length+ _decompressed_ bytes, like IO#read.  Returns
+      # fewer bytes only when the stream is closed, and +nil+ when the stream
+      # is closed before any data is read.
+      def read(length, buffer = nil)
+        while @buffer.bytesize < length
+          fill_buffer or break
+        end
+        data = @buffer.slice!(0, length)
+        return nil if data.empty? && length.positive?
+        buffer ? buffer.replace(data) : data
+      end
+
+      private
+
+      # Inflates the next chunk of compressed data into @buffer.  Returns
+      # false when the stream has been closed.
+      def fill_buffer
+        @buffer << @inflater.inflate(@socket.readpartial(1024))
+        true
+      rescue EOFError
+        false
       end
     end
 
