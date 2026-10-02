@@ -5,8 +5,13 @@ require "test/unit"
 
 class ESearchResultTest < Net::IMAP::TestCase
   ESearchResult = Net::IMAP::ESearchResult
+  SearchContextUpdate = Net::IMAP::SearchContextUpdate
   SequenceSet   = Net::IMAP::SequenceSet
   ExtensionData = Net::IMAP::ExtensionData
+
+  def parse(response)
+    Net::IMAP::ResponseParser.new.parse(response).data
+  end
 
   test "#to_sequence_set" do
     esearch = ESearchResult.new(nil, true, [])
@@ -130,6 +135,34 @@ class ESearchResultTest < Net::IMAP::TestCase
       ),
       result.partial
     )
+  end
+
+  test "RFC5267 ADDTO and REMOVEFROM accessors preserve order" do
+    result = parse(
+      "* ESEARCH (TAG \"A01\") UID ADDTO 2 9 ADDTO 4 10 REMOVEFROM 1 3\r\n"
+    )
+    assert_equal [
+      ["ADDTO",      SearchContextUpdate.new(name: "ADDTO",      position: 2, uids: [9])],
+      ["ADDTO",      SearchContextUpdate.new(name: "ADDTO",      position: 4, uids: [10])],
+      ["REMOVEFROM", SearchContextUpdate.new(name: "REMOVEFROM", position: 1, uids: [3])],
+    ], result.data
+    assert_equal SearchContextUpdate.new(
+      name: "ADDTO", position: 2, uids: [9]
+    ), result.add_to
+    assert_equal SearchContextUpdate.new(
+      name: "REMOVEFROM", position: 1, uids: [3]
+    ), result.remove_from
+    assert_same result.add_to, result.context_update
+  end
+
+  test "RFC5267 NOUPDATE and CANCELUPDATE response codes" do
+    parser = Net::IMAP::ResponseParser.new
+    response = parser.parse("A01 OK [NOUPDATE \"A00\"] no updates\r\n")
+    assert_equal "NOUPDATE", response.data.code.name
+    assert_equal "A00", response.data.code.data
+    response = parser.parse("A02 OK [CANCELUPDATE] cancelled\r\n")
+    assert_equal "CANCELUPDATE", response.data.code.name
+    assert_nil response.data.code.data
   end
 
 end

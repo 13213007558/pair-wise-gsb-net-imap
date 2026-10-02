@@ -220,6 +220,17 @@ module Net
       # See also: #to_a
       def partial;    data.assoc("PARTIAL")&.last    end
 
+      # RFC5267 ADDTO context update data.
+      def add_to;     data.assoc("ADDTO")&.last     end
+
+      # RFC5267 REMOVEFROM context update data.
+      def remove_from; data.assoc("REMOVEFROM")&.last end
+
+      # Returns the RFC5267 ADDTO or REMOVEFROM context update.
+      def context_update
+        add_to || remove_from
+      end
+
     end
   end
 end

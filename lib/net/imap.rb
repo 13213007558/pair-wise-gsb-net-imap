@@ -1254,6 +1254,7 @@ module Net
       # Client Protocol Receiver
       @parser = ResponseParser.new(config: @config)
       @responses = Hash.new {|h, k| h[k] = [] }
+      @search_contexts = {}
       @response_handlers = []
       @receiver_thread = nil
       @receiver_thread_exception = nil
@@ -1550,7 +1551,9 @@ module Net
     #
     # Related: #disconnect, #logout!
     def logout
-      send_command("LOGOUT")
+      send_command("LOGOUT").tap do
+        synchronize { invalidate_search_contexts! }
+      end
     end
 
     # Calls #logout then, after receiving the TaggedResponse for the +LOGOUT+,
@@ -1827,8 +1830,10 @@ module Net
       synchronize do
         state_unselected! # implicitly closes current mailbox
         @responses.clear
-        send_command(*args)
-          .tap do state_selected! end
+        send_command(*args).tap do
+          close_search_contexts!
+          state_selected!
+        end
       end
     end
 
@@ -1847,8 +1852,10 @@ module Net
       synchronize do
         state_unselected! # implicitly closes current mailbox
         @responses.clear
-        send_command(*args)
-          .tap do state_selected! end
+        send_command(*args).tap do
+          close_search_contexts!
+          state_selected!
+        end
       end
     end
 
@@ -2318,7 +2325,10 @@ module Net
     # Related: #unselect
     def close
       send_command("CLOSE")
-        .tap do state_authenticated! end
+        .tap do
+          close_search_contexts!
+          state_authenticated!
+        end
     end
 
     # Sends an {UNSELECT command [RFC3691 §2]}[https://www.rfc-editor.org/rfc/rfc3691#section-3]
@@ -2335,7 +2345,10 @@ module Net
     # [RFC3691[https://www.rfc-editor.org/rfc/rfc3691]].
     def unselect
       send_command("UNSELECT")
-        .tap do state_authenticated! end
+        .tap do
+          close_search_contexts!
+          state_authenticated!
+        end
     end
 
     # call-seq:
@@ -2584,6 +2597,13 @@ module Net
     #    {[RFC5267]}[https://rfc-editor.org/rfc/rfc5267]
     #    {[RFC9394]}[https://rfc-editor.org/rfc/rfc9394]
     #
+    # [+UPDATE+]
+    #   Subscribes the command to RFC5267 +ADDTO+ and +REMOVEFROM+ updates.
+    #   Pass <tt>context: true</tt> to append +UPDATE+ to +return+ options and
+    #   receive a SearchContext.  Contexts retain server order; do not treat the
+    #   result as an unordered UID set.  Cancel updates with
+    #   #cancel_search_update.
+    #
     # ===== +MODSEQ+ return data
     #
     # ESearchResult#modseq return data does not have a corresponding return
@@ -2791,6 +2811,9 @@ module Net
     #   {[RFC8474]}[https://www.rfc-editor.org/rfc/rfc8474.html#section-6]
     #
     # ==== Capabilities
+    #
+    # Pass <tt>context: true</tt> to use the RFC5267 +UPDATE+ return option and
+    #   receive a SearchContext.
     #
     # Return options should only be specified when the server supports
     # +IMAP4rev2+ or an extension that allows them, such as +ESEARCH+
@@ -3147,8 +3170,10 @@ module Net
     #
     # The server's capabilities must include +SORT+
     # [RFC5256[https://www.rfc-editor.org/rfc/rfc5256]].
-    def sort(sort_keys, search_keys, charset)
-      return sort_internal("SORT", sort_keys, search_keys, charset)
+    def sort(sort_keys, search_keys, charset, return: nil, context: false)
+      return sort_internal(
+        "SORT", sort_keys, search_keys, charset, return:, context:
+      )
     end
 
     # Sends a {UID SORT command [RFC5256 §3]}[https://www.rfc-editor.org/rfc/rfc5256#section-3]
@@ -3164,8 +3189,10 @@ module Net
     #
     # The server's capabilities must include +SORT+
     # [RFC5256[https://www.rfc-editor.org/rfc/rfc5256]].
-    def uid_sort(sort_keys, search_keys, charset)
-      return sort_internal("UID SORT", sort_keys, search_keys, charset)
+    def uid_sort(sort_keys, search_keys, charset, return: nil, context: false)
+      return sort_internal(
+        "UID SORT", sort_keys, search_keys, charset, return:, context:
+      )
     end
 
     # Sends a {THREAD command [RFC5256 §3]}[https://www.rfc-editor.org/rfc/rfc5256#section-3]
@@ -3661,6 +3688,33 @@ module Net
       end
     end
 
+    # Returns the active RFC5267 search context associated with +tag+.
+    def search_context(tag)
+      synchronize { @search_contexts[String(tag)] }
+    end
+
+    # Returns a frozen copy of all RFC5267 search contexts, keyed by command tag.
+    def search_contexts
+      synchronize { @search_contexts.dup.freeze }
+    end
+
+    # Sends +SEARCH CANCELUPDATE+ or +UID SEARCH CANCELUPDATE+ (RFC5267).
+    def cancel_search_update(context_or_tag, uid: nil)
+      if context_or_tag.respond_to?(:tag)
+        tag = context_or_tag.tag
+        uid = context_or_tag.uid if uid.nil?
+      else
+        tag = String(context_or_tag)
+      end
+      command = uid ? "UID SEARCH" : "SEARCH"
+      tagged = send_command(command, "CANCELUPDATE", tag)
+      synchronize do
+        apply_tagged_search_context(tagged)
+        @search_contexts[tag]&.cancel!
+      end
+      tagged
+    end
+
     private
 
     CRLF = "\r\n"      # :nodoc:
@@ -3755,6 +3809,7 @@ module Net
         case resp
         when TaggedResponse
           @tagged_responses[resp.tag] = resp
+          apply_search_context_status(resp)
           @tagged_response_arrival.broadcast
           case resp.tag
           when @logout_command_tag
@@ -3767,6 +3822,8 @@ module Net
           end
         when UntaggedResponse
           record_untagged_response(resp)
+          apply_search_context_response(resp)
+          apply_search_context_status(resp)
           if resp.name == "BYE" && @logout_command_tag.nil?
             state_logout!
             @sock.close
@@ -3776,7 +3833,10 @@ module Net
         when ContinuationRequest
           @continuation_request_arrival.signal
         end
-        state_unselected! if resp in {data: {code: {name: "CLOSED"}}}
+        if resp in {data: {code: {name: "CLOSED"}}}
+          close_search_contexts!
+          state_unselected!
+        end
         @response_handlers.each do |handler|
           handler.call(resp)
         end
@@ -3803,6 +3863,32 @@ module Net
       @responses[code.name] << code.data
     end
 
+    def apply_search_context_response(resp)
+      return unless resp.is_a?(UntaggedResponse) && resp.name == "ESEARCH"
+      data = resp.data
+      return unless data.is_a?(ESearchResult) && data.tag
+      context = @search_contexts[data.tag] or return
+      context.apply_or_ignore_esearch(data)
+    end
+
+    def apply_search_context_status(resp)
+      data = resp.data
+      return unless data.respond_to?(:code) && (code = data.code)
+      context =
+        if code.data
+          @search_contexts[code.data]
+        elsif resp.is_a?(TaggedResponse)
+          @search_contexts[resp.tag]
+        end
+      return unless context
+      case code.name
+      when "NOUPDATE"
+        context.noupdate!
+      when "CANCELUPDATE"
+        context.cancel!
+      end
+    end
+
     # NOTE: only call this for greeting, login, and authenticate
     def capabilities_from_resp_code(resp)
       return unless %w[PREAUTH OK].any? { _1.casecmp? resp.name }
@@ -3825,10 +3911,10 @@ module Net
       end
     end
 
-    def send_command(cmd, *args, &block)
+    def send_command(cmd, *args, tag: nil, &block)
       args.each do validate_data _1 end
       synchronize do
-        tag = generate_tag
+        tag ||= generate_tag
         command = Command[tag:, name: cmd]
         put_string(tag + " " + cmd)
         args.each do |i|
@@ -3966,8 +4052,14 @@ module Net
     RETURN_START = /\ARETURN\b/i
     private_constant :RETURN_WHOLE, :RETURN_START
 
-    def search_args(keys, charset_arg = nil, return: nil, charset: nil)
-      {return:} => {return: return_kw}
+    def search_args(keys, charset_arg = nil, return_options: nil, charset: nil, context: false)
+      if context
+        explicit_update = Array(return_options).any? {
+          /\AUPDATE\z/i.match?(String(_1))
+        }
+        return_options = [*return_options, "UPDATE"] unless explicit_update
+      end
+      {return: return_options} => {return: return_kw}
       case [return_kw, keys]
       in [nil, Array[RETURN_WHOLE, return_opts, *keys]]
         return_opts = convert_return_opts(return_opts)
@@ -3996,7 +4088,7 @@ module Net
       end
       args = normalize_searching_criteria(keys)
       args.prepend("CHARSET", charset)     if charset
-      args.prepend("RETURN",  return_opts) if return_opts
+      args.prepend("RETURN", return_opts) if return_opts
       return args, esearch
     end
 
@@ -4015,21 +4107,71 @@ module Net
       }
     end
 
-    def search_internal(cmd, ...)
-      args, esearch = search_args(...)
+    def register_search_context(tag:, command:)
+      context = SearchContext.new(
+        tag: tag, uid: command.start_with?("UID "), command: command
+      )
+      @search_contexts[tag] = context
+      context
+    end
+
+    def finalize_search_context(context, initial_result, tagged)
+      case initial_result
+      when SearchResult, Array
+        context.set_initial_result(initial_result)
+      when ESearchResult
+        context.set_initial_esearch(initial_result)
+      when OrderedSearchResult
+        context.replace_result(initial_result)
+      end
+      apply_tagged_search_context(tagged, context)
+      context
+    end
+
+    def apply_tagged_search_context(tagged, context = @search_contexts[tagged.tag])
+      code = tagged.data.code
+      return unless context && code
+      case code.name
+      when "NOUPDATE"
+        context.noupdate! if !code.data || code.data == tagged.tag
+      when "CANCELUPDATE"
+        context.cancel! if !code.data || code.data == tagged.tag
+      end
+    end
+
+    def close_search_contexts!
+      @search_contexts.each_value(&:close!)
+    end
+
+    def invalidate_search_contexts!
+      @search_contexts.each_value(&:invalidate!)
+    end
+
+    def search_internal(cmd, keys, charset_arg = nil, **options)
+      return_result = options.fetch(:return, nil)
+      subscribe_context = options.fetch(:context, false)
+      args, esearch = search_args(
+        keys, charset_arg, return_options: return_result,
+        charset: options.fetch(:charset, nil),
+        context: subscribe_context
+      )
       synchronize do
-        tagged = send_command(cmd, *args)
+        tag = subscribe_context ? generate_tag : nil
+        search_context = register_search_context(tag: tag, command: cmd) if tag
+        tagged = send_command(cmd, *args, tag: tag)
         tag    = tagged.tag
-        # Only the last ESEARCH or SEARCH is used.  Excess results are ignored.
         esearch_result = extract_responses("ESEARCH") {|response|
           response in ESearchResult(tag: ^tag)
-        }.last
+        }
         search_result = clear_responses("SEARCH").last
-        if esearch_result
-          # silently ignore SEARCH results, if any
-          esearch_result
+        if subscribe_context
+          search_context.set_initial_result(search_result) if search_result
+          finalize_search_context(search_context, nil, tagged)
+        elsif esearch_result.last
+          # Only the last ESEARCH is used.  Excess results are ignored.
+          esearch_result.last
         elsif search_result
-          # warn EXPECTED_ESEARCH_RESULT if esearch
+          # silently ignore SEARCH results, if any
           search_result
         elsif esearch
           # warn NO_SEARCH_RESPONSE
@@ -4094,11 +4236,33 @@ module Net
       send_command(cmd, SequenceSet.new(set), mailbox)
     end
 
-    def sort_internal(cmd, sort_keys, search_keys, charset)
+    def sort_internal(cmd, sort_keys, search_keys, charset, return: nil, context: false)
+      return_result = binding.local_variable_get(:return)
+      subscribe_context = context
       search_keys = normalize_searching_criteria(search_keys)
+      return_opts = nil
+      if return_result || subscribe_context
+        return_arguments = convert_return_opts([*return_result])
+        return_arguments << "UPDATE" if subscribe_context
+      end
       synchronize do
-        send_command(cmd, sort_keys, charset, *search_keys)
-        clear_responses("SORT").last || []
+        args = []
+        args.push("RETURN", return_arguments) if return_arguments
+        tag = subscribe_context ? generate_tag : nil
+        search_context = register_search_context(tag: tag, command: cmd) if tag
+        tagged = send_command(
+          cmd, sort_keys, *args, charset, *search_keys, tag: tag
+        )
+        sort_result = clear_responses("SORT").last
+        esearch_results = extract_responses("ESEARCH") {|response|
+          response.is_a?(ESearchResult) && response.tag == tagged.tag
+        }
+        if subscribe_context
+          search_context.set_initial_result(sort_result) if sort_result
+          finalize_search_context(search_context, nil, tagged)
+        else
+          sort_result || esearch_results.last || []
+        end
       end
     end
 
@@ -4191,6 +4355,7 @@ module Net
       synchronize do
         return true if connection_state in [:logout, *]
         @connection_state = ConnectionState::Logout.new
+        invalidate_search_contexts!
       end
     end
 
@@ -4227,6 +4392,7 @@ require_relative "imap/command_data"
 require_relative "imap/data_encoding"
 require_relative "imap/flags"
 require_relative "imap/response_data"
+require_relative "imap/search_context"
 require_relative "imap/response_parser"
 require_relative "imap/authenticators"
 

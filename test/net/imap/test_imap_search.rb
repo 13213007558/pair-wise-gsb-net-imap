@@ -7,6 +7,133 @@ require_relative "fake_server"
 class IMAPSearchTest < Net::IMAP::TestCase
   include Net::IMAP::FakeServer::TestHelper
 
+  test "CONTEXT=SEARCH subscribes to updates by correlator" do
+    with_fake_server do |server, imap|
+      server.on "UID SEARCH" do |cmd|
+        cmd.untagged "ESEARCH", '(TAG "%s") UID ALL 3,1,4' % [cmd.tag]
+        cmd.done_ok
+        cmd.untagged "ESEARCH", '(TAG "%s") UID ADDTO 2 9' % [cmd.tag]
+        cmd.untagged "ESEARCH", '(TAG "%s") UID REMOVEFROM 4 4' % [cmd.tag]
+      end
+
+      context = imap.uid_search(["ALL"], context: true)
+      wait_for { context.updates.size == 2 }
+      assert_equal [3, 9, 1], context.to_a
+      assert_equal [3, 1, 4], context.updates.first.before
+      assert_equal [3, 9, 1], context.updates.last.after
+      assert_same context, imap.search_context(context.tag)
+      assert_equal "RETURN (UPDATE) ALL", server.commands.pop.args
+    end
+  end
+
+  test "multiple updates and two contexts can interleave" do
+    with_fake_server do |server, imap|
+      server.on "UID SEARCH" do |cmd|
+        cmd.untagged "ESEARCH", '(TAG "%s") UID ALL 1,2,3' % [cmd.tag]
+        cmd.done_ok
+      end
+
+      alpha = imap.uid_search(["ALL"], context: true)
+      beta  = imap.uid_search(["ALL"], context: true)
+
+      server.unsolicited "ESEARCH", '(TAG "%s") UID ADDTO 2 10' % [alpha.tag]
+      server.unsolicited "ESEARCH", '(TAG "%s") UID REMOVEFROM 1 1' % [beta.tag]
+      server.unsolicited "ESEARCH", '(TAG "%s") UID ADDTO 2 20 ADDTO 4 30' % [alpha.tag]
+      server.unsolicited "ESEARCH", '(TAG "%s") UID ADDTO 3 6' % [beta.tag]
+
+      wait_for { alpha.to_a == [1, 20, 10, 30, 2, 3] }
+      wait_for { beta.to_a == [2, 3, 6] }
+      assert_equal [1, 20, 10, 30, 2, 3], alpha.to_a
+      assert_equal [2, 3, 6], beta.to_a
+    end
+  end
+
+  test "NOUPDATE is observable and does not apply later updates" do
+    with_fake_server do |server, imap|
+      server.on "UID SEARCH" do |cmd|
+        cmd.untagged "ESEARCH", '(TAG "%s") UID ALL 1,2' % [cmd.tag]
+        cmd.done_ok "updates unavailable", code: 'NOUPDATE "%s"' % [cmd.tag]
+        cmd.untagged "ESEARCH", '(TAG "%s") UID ADDTO 3 3' % [cmd.tag]
+      end
+
+      context = imap.uid_search(["ALL"], context: true)
+      assert_predicate context, :noupdate?
+      assert_equal [1, 2], context.to_a
+    end
+  end
+
+  test "CANCELUPDATE stops applying old updates" do
+    with_fake_server do |server, imap|
+      tags = {}
+      server.on "UID SEARCH" do |cmd|
+        if cmd.args.start_with?("CANCELUPDATE")
+          tags[:cancel] = cmd.tag
+          cmd.done_ok "cancelled", code: 'CANCELUPDATE "%s"' % [tags[:search]]
+        else
+          tags[:search] = cmd.tag
+          cmd.untagged "ESEARCH", '(TAG "%s") UID ALL 1,2' % [cmd.tag]
+          cmd.done_ok
+        end
+      end
+      server.on "NOOP" do |cmd|
+        cmd.untagged "ESEARCH", '(TAG "%s") UID ADDTO 3 3' % [tags[:search]]
+        cmd.done_ok
+      end
+
+      context = imap.uid_search(["ALL"], context: true)
+      imap.cancel_search_update(context)
+      imap.noop
+      wait_for { context.ignored_updates.size == 1 }
+      assert_predicate context, :cancelled?
+      assert_equal [1, 2], context.to_a
+      commands = 3.times.map { server.commands.pop.args }
+      assert_include commands, "CANCELUPDATE #{context.tag}"
+    end
+  end
+
+  test "CONTEXT=SORT preserves sorted order through updates" do
+    with_fake_server do |server, imap|
+      server.on "UID SORT" do |cmd|
+        cmd.untagged "ESEARCH", '(TAG "%s") UID ALL 9,1,5' % [cmd.tag]
+        cmd.done_ok
+        cmd.untagged "ESEARCH", '(TAG "%s") UID ADDTO 3 3' % [cmd.tag]
+        cmd.untagged "ESEARCH", '(TAG "%s") UID REMOVEFROM 4 5' % [cmd.tag]
+      end
+
+      context = imap.uid_sort(["ARRIVAL"], ["ALL"], "UTF-8", context: true)
+      wait_for { context.to_a == [9, 1, 3] }
+      assert_equal [9, 1, 3], context.to_a
+      assert_equal "(ARRIVAL) RETURN (UPDATE) UTF-8 ALL", server.commands.pop.args
+    end
+  end
+
+  test "selecting another mailbox closes existing contexts" do
+    with_fake_server do |server, imap|
+      imap.select "INBOX"
+      server.on "UID SEARCH" do |cmd|
+        cmd.untagged "ESEARCH", '(TAG "%s") UID ALL 1' % [cmd.tag]
+        cmd.done_ok
+      end
+      context = imap.uid_search(["ALL"], context: true)
+      imap.unselect
+      assert_predicate context, :closed?
+    end
+  end
+
+  test "partial context does not pretend unknown results are empty" do
+    with_fake_server do |server, imap|
+      server.on "UID SEARCH" do |cmd|
+        cmd.untagged "ESEARCH", '(TAG "%s") UID PARTIAL (-2:-1 8,9)' % [cmd.tag]
+        cmd.done_ok
+      end
+
+      context = imap.uid_search(["ALL"], return: ["PARTIAL", -2..-1], context: true)
+      assert_equal [8, 9], context.to_a
+      assert_predicate context.result, :partial?
+      assert_nil context.result.unknown_prefix_size
+    end
+  end
+
   test("#search/#uid_search") do
     with_fake_server do |server, imap|
       search_result = Net::IMAP::SearchResult[
@@ -223,6 +350,14 @@ class IMAPSearchTest < Net::IMAP::TestCase
       found = imap.uid_thread "REFERENCES", ["subject", "hello"], "UTF-8"
       assert_equal [], found
     end
+  end
+
+  private
+
+  def wait_for(timeout: 1)
+    deadline = Time.now + timeout
+    sleep 0.001 until yield || Time.now > deadline
+    assert yield
   end
 
 end

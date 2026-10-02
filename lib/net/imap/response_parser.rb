@@ -1566,6 +1566,11 @@ module Net
           when "COUNT"      then number
           when "MODSEQ"     then mod_sequence_value         # RFC7162: CONDSTORE
           when "PARTIAL"    then ret_data_partial__value    # RFC9394: PARTIAL
+          when "ADDTO", "REMOVEFROM"                       # RFC5267
+            position = nz_number; SP!; uniqueid = nz_number
+            SearchContextUpdate.new(
+              name: label, position: position, uids: [uniqueid]
+            )
           else search_return_value
           end
         [label, value]
@@ -1962,6 +1967,9 @@ module Net
       #
       # RFC9586: UIDONLY
       #   resp-text-code   =/ "UIDREQUIRED"
+      # RFC5267 (CONTEXT=SEARCH, CONTEXT=SORT):
+      #   resp-text-code   =/ "NOUPDATE" [SP tag-string] /
+      #                     "CANCELUPDATE" [SP tag-string]
       def resp_text_code
         name = resp_text_code__name
         state = current_state
@@ -1986,6 +1994,8 @@ module Net
           when "MODIFIED"           then SP!; sequence_set         # CONDSTORE
           when "MAILBOXID"          then SP!; parens__objectid     # RFC8474: OBJECTID
           when "UIDREQUIRED"        then                           # RFC9586: UIDONLY
+          when "NOUPDATE", "CANCELUPDATE"                      # RFC5267
+            SP? ? tag_string : nil
           else
             state = nil # don't backtrack
             SP? and text_chars_except_rbra
