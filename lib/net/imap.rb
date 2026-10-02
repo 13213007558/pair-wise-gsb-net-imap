@@ -949,6 +949,7 @@ module Net
     dir = File.expand_path("imap", __dir__)
     autoload :ConnectionState,        "#{dir}/connection_state"
     autoload :ResponseReader,         "#{dir}/response_reader"
+    autoload :RenamePlanner,          "#{dir}/rename_planner"
     autoload :SASL,                   "#{dir}/sasl"
     autoload :SASLAdapter,            "#{dir}/sasl_adapter"
     autoload :SequenceSet,            "#{dir}/sequence_set"
