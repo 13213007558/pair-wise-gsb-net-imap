@@ -891,6 +891,10 @@ module Net
   #   Resynchronization (CONDSTORE) and Quick Mailbox Resynchronization
   #   (QRESYNC)", RFC 7162, DOI 10.17487/RFC7162, May 2014,
   #   <https://www.rfc-editor.org/info/rfc7162>.
+  #
+  #   <em>See MailboxView for an optional local UID-keyed view of a mailbox,
+  #   maintained from SELECT/QRESYNC, FETCH, EXPUNGE, and VANISHED
+  #   responses.</em>
   # [OBJECTID[https://www.rfc-editor.org/rfc/rfc8474]]::
   #   Gondwana, B., Ed., "IMAP Extension for Object Identifiers",
   #   RFC 8474, DOI 10.17487/RFC8474, September 2018,
@@ -948,6 +952,7 @@ module Net
 
     dir = File.expand_path("imap", __dir__)
     autoload :ConnectionState,        "#{dir}/connection_state"
+    autoload :MailboxView,            "#{dir}/mailbox_view"
     autoload :ResponseReader,         "#{dir}/response_reader"
     autoload :SASL,                   "#{dir}/sasl"
     autoload :SASLAdapter,            "#{dir}/sasl_adapter"
