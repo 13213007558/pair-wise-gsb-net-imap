@@ -948,6 +948,7 @@ module Net
 
     dir = File.expand_path("imap", __dir__)
     autoload :ConnectionState,        "#{dir}/connection_state"
+    autoload :MailboxView,            "#{dir}/mailbox_view"
     autoload :ResponseReader,         "#{dir}/response_reader"
     autoload :SASL,                   "#{dir}/sasl"
     autoload :SASLAdapter,            "#{dir}/sasl_adapter"
@@ -1821,9 +1822,13 @@ module Net
     # the +condstore+ keyword parameter may be used.
     #   imap.select("mbox", condstore: true)
     #   modseq = imap.responses("HIGHESTMODSEQ", &:last)
-    def select(mailbox, condstore: false)
+    #
+    # If QRESYNC is enabled, the +qresync+ keyword is a
+    # +[uidvalidity, modseq, known_uids]+ parameter for quick resynchronization.
+    def select(mailbox, condstore: false, qresync: nil)
       args = ["SELECT", mailbox]
       args << ["CONDSTORE"] if condstore
+      args << qresync_parameter(qresync) if qresync
       synchronize do
         state_unselected! # implicitly closes current mailbox
         @responses.clear
@@ -1836,14 +1841,16 @@ module Net
     # to select a +mailbox+ so that messages in the +mailbox+ can be accessed.
     # Behaves the same as #select, except that the selected +mailbox+ is
     # identified as read-only.
+    # Supports the same +condstore+ and +qresync+ parameters as #select.
     #
     # A Net::IMAP::NoResponseError is raised if the mailbox does not
     # exist or is for some reason non-examinable.
     #
     # Related: #select
-    def examine(mailbox, condstore: false)
+    def examine(mailbox, condstore: false, qresync: nil)
       args = ["EXAMINE", mailbox]
       args << ["CONDSTORE"] if condstore
+      args << qresync_parameter(qresync) if qresync
       synchronize do
         state_unselected! # implicitly closes current mailbox
         @responses.clear
@@ -3241,10 +3248,6 @@ module Net
     #   See {[RFC7162 §3.1]}[https://www.rfc-editor.org/rfc/rfc7162.html#section-3.1].
     #
     # [+QRESYNC+ {[RFC7162]}[https://www.rfc-editor.org/rfc/rfc7162.html]]
-    #   *NOTE:* Enabling QRESYNC will replace +EXPUNGE+ with +VANISHED+, but
-    #   the extension arguments to #select, #examine, and #uid_fetch are not
-    #   supported yet.
-    #
     #   Adds quick resynchronization options to #select, #examine, and
     #   #uid_fetch.  +QRESYNC+ _must_ be explicitly enabled before using any of
     #   the extension's command parameters.  All +EXPUNGE+ responses will be
@@ -3645,10 +3648,12 @@ module Net
     # This ensures every server response is handled, including the #greeting.
     #
     # Related: #remove_response_handler, #response_handlers
-    def add_response_handler(handler = nil, &block)
+    def add_response_handler(handler = nil, priority: false, &block)
       raise ArgumentError, "two Procs are passed" if handler && block
       synchronize do
-        @response_handlers.push(block || handler)
+        response_handler = block || handler
+        priority ? @response_handlers.unshift(response_handler) :
+          @response_handlers.push(response_handler)
       end
     end
 
@@ -4069,6 +4074,26 @@ module Net
       args = [cmd, set, attr]
       args << mod if mod
       send_command_returning_fetch_results(*args)
+    end
+
+    def qresync_parameter(value)
+      case value
+      in [uidvalidity, modseq, *uids]
+        uidvalidity = Integer(uidvalidity)
+        modseq      = Integer(modseq)
+        known_uids = if uids.one? && uids.first.is_a?(SequenceSet)
+                       uids.first
+                     else
+                       SequenceSet.new(uids.length == 1 ? uids.first : uids)
+                     end
+      else
+        raise ArgumentError,
+              "qresync must be [uidvalidity, modseq, known_uids]"
+      end
+      unless uidvalidity.positive? && modseq >= 0 && known_uids.valid?
+        raise ArgumentError, "invalid QRESYNC parameters"
+      end
+      [Atom["QRESYNC"], uidvalidity, modseq, known_uids]
     end
 
     def store_internal(cmd, set, attr, flags, unchangedsince: nil)
