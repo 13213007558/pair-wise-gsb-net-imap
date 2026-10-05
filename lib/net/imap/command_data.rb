@@ -95,6 +95,43 @@ module Net
 
     def send_binary_literal(*, **) = send_literal(*, **, binary: true)
 
+    def send_literal_io(io, bytesize, tag = nil, binary: false, non_sync: nil)
+      synchronize do
+        if non_sync && !non_sync_literal_allowed?(bytesize)
+          # TODO: check in Printer, so we don't need to close the connection.
+          @sock.close
+          raise DataFormatError, "Connection closed: " \
+            "Cannot send non-synchronizing literal without known server support"
+        end
+        non_sync = non_sync_literal?(bytesize) if non_sync.nil?
+        prefix = "~" if binary
+        plus = "+" if non_sync
+        unless non_sync
+          prepare_command_continuation(tag)
+        end
+        put_string("#{prefix}{#{bytesize}#{plus}}\r\n")
+      end
+      wait_command_continuation(tag) unless non_sync
+      copy_literal_io(io, bytesize)
+    end
+
+    def copy_literal_io(io, bytesize)
+      remaining = bytesize
+      until remaining.zero?
+        chunk = io.read(remaining)
+        if chunk.nil? || chunk.empty?
+          raise DataFormatError,
+            "literal IO ended after #{bytesize - remaining} of #{bytesize} bytes"
+        end
+        unless chunk.bytesize <= remaining
+          raise DataFormatError,
+            "literal IO returned more than #{bytesize} bytes"
+        end
+        put_string(chunk)
+        remaining -= chunk.bytesize
+      end
+    end
+
     # `non_sync` is an optional tri-state flag:
     # * `true`  -> Force non-synchronizing `LITERAL+`/`LITERAL-` behavior.
     #   NOTE: raises DataFormatError when server doesn't support
@@ -113,22 +150,48 @@ module Net
         non_sync = non_sync_literal?(bytesize) if non_sync.nil?
         prefix = "~" if binary
         plus = "+" if non_sync
+        unless non_sync
+          prepare_command_continuation(tag)
+        end
         put_string("#{prefix}{#{bytesize}#{plus}}\r\n")
         if non_sync
           put_string(str)
           return
         end
+      end
+      wait_command_continuation(tag) unless non_sync
+      put_string(str)
+    end
+
+    def wait_command_continuation(tag)
+      begin
+        synchronize do
+          raise_early_tagged_response(tag) if @tagged_responses.key?(tag)
+          until @continuation_request || @continuation_request_exception ||
+                @exception || @tagged_responses.key?(tag)
+            @continuation_request_arrival.wait
+          end
+          reraise @continuation_request_exception || @exception
+          raise_early_tagged_response(tag) if @tagged_responses.key?(tag)
+        end
+      ensure
+        @continued_command_tag = nil
+        @continuation_request_exception = nil
+        @continuation_request = nil
+      end
+    end
+
+    def prepare_command_continuation(tag)
+      synchronize do
+        raise_early_tagged_response(tag) if @tagged_responses.key?(tag)
         @continued_command_tag = tag
         @continuation_request_exception = nil
-        begin
-          @continuation_request_arrival.wait
-          reraise @continuation_request_exception || @exception
-          put_string(str)
-        ensure
-          @continued_command_tag = nil
-          @continuation_request_exception = nil
-        end
       end
+    end
+
+    def raise_early_tagged_response(tag)
+      response = @tagged_responses[tag]
+      raise RESPONSE_ERRORS[response.name].new(response) if response
     end
 
     def non_sync_literal?(bytesize)
@@ -369,6 +432,109 @@ module Net
 
       def send_data(imap, tag)
         imap.__send__(:send_binary_literal, data, tag, non_sync:)
+      end
+    end
+
+    class IOCommandData # :nodoc:
+      def self.validate(...) = new(...).tap(&:validate)
+
+      def validate; end
+    end
+
+    class LiteralIO < IOCommandData # :nodoc:
+      attr_reader :data, :bytesize, :non_sync
+
+      def initialize(data, bytesize = nil, non_sync: nil)
+        data.respond_to?(:read) or
+          raise TypeError, "expected IO-like object, got #{data.class}"
+        bytesize = data.bytesize if bytesize.nil? && data.respond_to?(:bytesize)
+        bytesize = data.size     if bytesize.nil? && data.respond_to?(:size)
+        unless bytesize
+          raise ArgumentError,
+            "#{data.class} literal requires a known byte length"
+        end
+        @bytesize = NumValidator.coerce_number64(Integer(bytesize))
+        @data = data
+        @non_sync = non_sync
+      end
+
+      def send_data(imap, tag)
+        imap.__send__(:send_literal_io, data, bytesize, tag, non_sync:)
+      end
+    end
+
+    class Literal8IO < LiteralIO # :nodoc:
+      def send_data(imap, tag)
+        imap.__send__(:send_literal_io, data, bytesize, tag, binary: true,
+                       non_sync:)
+      end
+    end
+
+    private_constant :IOCommandData, :LiteralIO, :Literal8IO
+
+    # Represents one message argument for Net::IMAP#multiappend.
+    #
+    # +message+ may be a String or an IO-like object.  When it is an IO-like
+    # object, its byte length is taken from +bytesize+ or +length+, or from the
+    # object's own +bytesize+ or +size+ when neither option is provided.
+    #
+    # Pass <tt>binary: true</tt> to send an IO containing NUL bytes using a
+    # BINARY literal.  Pass <tt>non_sync: true</tt> or <tt>false</tt> to force
+    # non-synchronizing or synchronizing literal behavior, respectively.
+    class AppendMessage < IOCommandData
+      def initialize(message, flags: nil, date_time: nil, binary: nil,
+                     non_sync: nil, bytesize: nil, length: nil)
+        @flags = flags && Array(flags)
+        @date_time = date_time
+        explicit_bytesize = bytesize || length
+        @literal = coerce_literal(message, binary, non_sync, explicit_bytesize)
+      end
+
+      def validate
+        flags&.each { Flag.new(data: _1) }
+        unless date_time.nil? || (date_time in Time | Date | DateTime)
+          raise DataFormatError, "invalid APPEND internal date: #{date_time.class}"
+        end
+      end
+
+      def send_data(imap, tag)
+        values = []
+        values << flags if flags&.any?
+        values << date_time if date_time
+        values << literal
+        values.each_with_index do |data, index|
+          imap.__send__(:put_string, " ") unless index.zero?
+          imap.__send__(:send_data, data, tag)
+        end
+      end
+
+      private
+
+      attr_reader :flags, :date_time, :literal
+
+      def coerce_literal(message, binary, non_sync, explicit_bytesize = nil)
+        case message
+        when Literal, Literal8, LiteralIO, Literal8IO
+          message
+        when String
+          if binary
+            Literal8.new(data: message, non_sync:)
+          else
+            literal = StringFormatter.literal_or_literal8(message)
+            non_sync.nil? ? literal : literal.class.new(data: message, non_sync:)
+          end
+        else
+          unless message.respond_to?(:read)
+            raise TypeError,
+              "expected message to be a String or IO, got #{message.class}"
+          end
+          bytesize = explicit_bytesize
+          bytesize ||= message.bytesize if message.respond_to?(:bytesize)
+          bytesize ||= message.size if message.respond_to?(:size)
+          binary = message.binmode? if binary.nil? && message.respond_to?(:binmode?)
+          literal_class = binary ? Literal8IO : LiteralIO
+          literal_class.new(message, bytesize, non_sync: non_sync)
+        end
       end
     end
 

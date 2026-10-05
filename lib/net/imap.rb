@@ -1268,6 +1268,7 @@ module Net
       @continued_command_tag = nil
       @continuation_request_arrival = new_cond
       @continuation_request_exception = nil
+      @continuation_request = nil
       @idle_done_cond = nil
       @logout_command_tag = nil
 
@@ -2288,9 +2289,6 @@ module Net
     # This will report the UIDVALIDITY of the destination mailbox and the
     # assigned UID of the appended message.
     #
-    #--
-    # TODO: add MULTIAPPEND support
-    #++
     def append(mailbox, message, flags = nil, date_time = nil)
       message = StringFormatter.literal_or_literal8(message, name: "message")
       args = []
@@ -2299,6 +2297,95 @@ module Net
       args.push(message)
       send_command("APPEND", mailbox, *args)
     end
+
+    # Sends an {MULTIAPPEND command [RFC3502]}[https://www.rfc-editor.org/rfc/rfc3502.html]
+    # to atomically append one or more +messages+ to the end of +mailbox+.
+    #
+    # Each element of +messages+ may be a String, an IO-like object whose
+    # byte length is known, or a Hash or AppendMessage.  The Hash/AppendMessage
+    # options set that message's initial +flags+, internal +date_time+,
+    # +bytesize+ (or +length+), and non-synchronizing literal preference.  Pass
+    # <tt>binary: true</tt> to send an IO containing NUL bytes as a +BINARY+
+    # literal.
+    #
+    # ==== Capabilities
+    #
+    # Requires the +MULTIAPPEND+ extension
+    # {[RFC3502]}[https://www.rfc-editor.org/rfc/rfc3502.html].  +LITERAL++ and
+    # +LITERAL-+ may be used for message bodies when the server advertises them.
+    # +BINARY+ is required for a body containing NUL bytes.
+    #
+    # The server assigns UIDs in request order.  When +UIDPLUS+ or +IMAP4rev2+
+    # returns an +APPENDUID+ response code, this method returns the assigned
+    # UIDs as an Array, ordered to correspond with +messages+.
+    def multiappend(mailbox, *messages)
+      messages = messages.first if messages.length == 1 && messages.first.is_a?(Array)
+      messages.map! do |message|
+        case message
+        when AppendMessage then message
+        when String then AppendMessage.new(message)
+        when Hash
+          body = message[:message] || message[:body] or
+            raise ArgumentError, "missing message body"
+          explicit_length =
+            if message.key?(:bytesize)
+              message[:bytesize]
+            elsif message.key?(:length)
+              message[:length]
+            end
+          AppendMessage.new(
+            body,
+            flags:     message[:flags],
+            date_time: message[:date_time] || message[:internal_date],
+            binary:    message[:binary],
+            non_sync:  message[:non_sync],
+            bytesize:  explicit_length,
+          )
+        else
+          AppendMessage.new(message)
+        end
+      end
+      messages.any? or raise ArgumentError, "no messages to append"
+
+      begin
+        response = synchronize do
+          send_command("MULTIAPPEND", mailbox, *messages)
+        end
+        appenduid_response_uids(response, messages.length)
+      rescue InvalidResponseError
+        disconnect
+        raise
+      ensure
+        disconnect if !$!.nil? && !$!.is_a?(ResponseError)
+      end
+    end
+
+    alias multi_append multiappend
+
+    private
+
+    def appenduid_response_uids(response, expected_count)
+      appenduid = response.data&.code&.name == "APPENDUID" && response.data.code.data
+      unless appenduid
+        raise InvalidResponseError,
+          "MULTIAPPEND completed without APPENDUID response"
+      end
+      assigned_uids = appenduid.assigned_uids
+      unless assigned_uids.count_with_duplicates == expected_count
+        raise InvalidResponseError,
+          "APPENDUID contains %d UIDs, expected %d" % [
+            assigned_uids.count_with_duplicates, expected_count
+          ]
+      end
+      uids = assigned_uids.each_ordered_number.to_a
+      unless uids.length == expected_count && uids.uniq.length == expected_count
+        raise InvalidResponseError,
+          "APPENDUID UIDs do not uniquely identify %d messages" % expected_count
+      end
+      uids
+    end
+
+    public
 
     # Sends a {CHECK command [IMAP4rev1 §6.4.1]}[https://www.rfc-editor.org/rfc/rfc3501#section-6.4.1]
     # to request a checkpoint of the currently selected mailbox.  This performs
@@ -3774,6 +3861,7 @@ module Net
             connection_closed = true
           end
         when ContinuationRequest
+          @continuation_request = resp if @continued_command_tag
           @continuation_request_arrival.signal
         end
         state_unselected! if resp in {data: {code: {name: "CLOSED"}}}
