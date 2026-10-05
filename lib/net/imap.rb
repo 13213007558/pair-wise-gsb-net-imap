@@ -689,6 +689,12 @@ module Net
   # - Updates #store and #uid_store with the +unchangedsince+ modifier and adds
   #   the +MODIFIED+ ResponseCode to the tagged response.
   #
+  # ==== RFC7162: +QRESYNC+
+  #
+  # - Updates #select and #examine with the +qresync+ parameter.
+  # - Adds #resynchronize to enable QRESYNC, open the mailbox, and return the
+  #   deleted, updated, and missing messages in one operation.
+  #
   # ==== RFC7888: <tt>LITERAL+</tt>
   # - Literal strings smaller than Config#max_non_synchronizing_literal bytes
   #   are sent without waiting for the server's continuation request.
@@ -1804,6 +1810,12 @@ module Net
     # #select and all +FETCH+ responses will include FetchData#modseq.
     # Otherwise, the +NOMODSEQ+ ResponseCode will be sent.
     #
+    # When +qresync+ is set to a QResyncParameters object, a QResyncCheckpoint,
+    # or an option hash, the command includes the +QRESYNC+ resynchronization
+    # parameter and returns a QResyncResult.  The extension must already have
+    # been enabled with #enable, or use #resynchronize to enable it and select
+    # in one call.
+    #
     # A Net::IMAP::NoResponseError is raised if the mailbox does not
     # exist or is for some reason non-selectable.
     #
@@ -1821,15 +1833,9 @@ module Net
     # the +condstore+ keyword parameter may be used.
     #   imap.select("mbox", condstore: true)
     #   modseq = imap.responses("HIGHESTMODSEQ", &:last)
-    def select(mailbox, condstore: false)
-      args = ["SELECT", mailbox]
-      args << ["CONDSTORE"] if condstore
-      synchronize do
-        state_unselected! # implicitly closes current mailbox
-        @responses.clear
-        send_command(*args)
-          .tap do state_selected! end
-      end
+    def select(mailbox, condstore: false, qresync: nil)
+      select_or_examine("SELECT", mailbox,
+                        condstore: condstore, qresync: qresync)
     end
 
     # Sends a {EXAMINE command [IMAP4rev1 §6.3.2]}[https://www.rfc-editor.org/rfc/rfc3501#section-6.3.2]
@@ -1841,16 +1847,47 @@ module Net
     # exist or is for some reason non-examinable.
     #
     # Related: #select
-    def examine(mailbox, condstore: false)
-      args = ["EXAMINE", mailbox]
-      args << ["CONDSTORE"] if condstore
-      synchronize do
-        state_unselected! # implicitly closes current mailbox
-        @responses.clear
-        send_command(*args)
-          .tap do state_selected! end
-      end
+    def examine(mailbox, condstore: false, qresync: nil)
+      select_or_examine("EXAMINE", mailbox,
+                        condstore: condstore, qresync: qresync)
     end
+
+    # Sends ENABLE and a QRESYNC-enabled SELECT or EXAMINE command to quickly
+    # resynchronize +mailbox+.  Pass either a previous QResyncCheckpoint or the
+    # checkpoint's +uidvalidity+, +modseq+, and +known_uids+ values.
+    #
+    # Returns a QResyncResult.  When its #status is +:ok+, +deleted+ contains
+    # UIDs removed before this session (responses with +VANISHED (EARLIER)+),
+    # +updated+ contains FetchData for changed known UIDs, +missing+ contains
+    # new UIDs whose full messages must be fetched, and +vanished+ contains
+    # UIDs removed during this session with a non-EARLIER +VANISHED+ response.
+    # +expunged+ contains legacy message sequence numbers, if the server sends
+    # +EXPUNGE+ despite QRESYNC being enabled.
+    #
+    # When the mailbox UIDVALIDITY changed or the server returns +NOMODSEQ+,
+    # #rebuild_required? is true.  In that case the old UID set must not be
+    # merged with the returned mailbox state.  A new checkpoint is returned
+    # only after the command has completed successfully.
+    def resynchronize(mailbox, checkpoint = nil, uidvalidity: nil, modseq: nil,
+                      known_uids: nil, examine: false, enable: true)
+      qresync =
+        if checkpoint
+          unless uidvalidity.nil? && modseq.nil? && known_uids.nil?
+            raise ArgumentError, "checkpoint cannot be combined with checkpoint fields"
+          end
+          QResyncParameters.coerce(checkpoint)
+        else
+          QResyncParameters.new(
+            uidvalidity: uidvalidity,
+            modseq:      modseq,
+            known_uids:  known_uids || SequenceSet.empty,
+          )
+        end
+      enable("QRESYNC") if enable && !enabled?("QRESYNC")
+      command = examine ? method(:examine) : method(:select)
+      command.call(mailbox, qresync: qresync)
+    end
+    alias qresync resynchronize
 
     # Sends a {CREATE command [IMAP4rev1 §6.3.3]}[https://www.rfc-editor.org/rfc/rfc3501#section-6.3.3]
     # to create a new +mailbox+.
@@ -3241,15 +3278,12 @@ module Net
     #   See {[RFC7162 §3.1]}[https://www.rfc-editor.org/rfc/rfc7162.html#section-3.1].
     #
     # [+QRESYNC+ {[RFC7162]}[https://www.rfc-editor.org/rfc/rfc7162.html]]
-    #   *NOTE:* Enabling QRESYNC will replace +EXPUNGE+ with +VANISHED+, but
-    #   the extension arguments to #select, #examine, and #uid_fetch are not
-    #   supported yet.
-    #
-    #   Adds quick resynchronization options to #select, #examine, and
-    #   #uid_fetch.  +QRESYNC+ _must_ be explicitly enabled before using any of
-    #   the extension's command parameters.  All +EXPUNGE+ responses will be
-    #   replaced with +VANISHED+ responses.  Enabling +QRESYNC+ implicitly
-    #   enables +CONDSTORE+ as well.
+    #   Adds quick resynchronization options to #select and #examine, exposed
+    #   through #resynchronize.  +QRESYNC+ _must_ be explicitly enabled before
+    #   using the extension's command parameters; #resynchronize enables it
+    #   automatically.  All +EXPUNGE+ responses should be replaced with
+    #   +VANISHED+ responses.  Enabling +QRESYNC+ implicitly enables
+    #   +CONDSTORE+ as well.
     #   See {[RFC7162 §3.2]}[https://www.rfc-editor.org/rfc/rfc7162.html#section-3.2].
     #
     # [+:utf8+ --- an alias for <tt>"UTF8=ACCEPT"</tt>]
@@ -3960,6 +3994,112 @@ module Net
           VanishedData[uids: merged_uids, earlier: false]
         end
       end
+    end
+
+    def select_or_examine(command, mailbox, condstore:, qresync:)
+      qresync = qresync_parameters(qresync)
+      if condstore && qresync
+        raise ArgumentError, "condstore and qresync cannot both be specified"
+      end
+      args = [command, mailbox]
+      args << ["CONDSTORE"] if condstore
+      args << qresync.to_command_args if qresync
+      synchronize do
+        state_unselected! # implicitly closes current mailbox
+        @responses.clear
+        send_command(*args)
+        if qresync
+          build_qresync_result(qresync)
+        else
+          state_selected!
+          true
+        end
+      end
+    end
+
+    def qresync_parameters(value)
+      case value
+      when nil then nil
+      when QResyncParameters then value
+      when QResyncCheckpoint then QResyncParameters.coerce(value)
+      when Hash
+        options = value.transform_keys(&:to_sym)
+        QResyncParameters.new(
+          uidvalidity: options.fetch(:uidvalidity),
+          modseq:      options.fetch(:modseq),
+          known_uids:  options.fetch(:known_uids, SequenceSet.empty),
+        )
+      else
+        raise ArgumentError,
+              "expected QResyncParameters, QResyncCheckpoint, Hash, or nil, got #{value.class}"
+      end
+    end
+
+    def build_qresync_result(params)
+      state_selected!
+      uidvalidity = clear_responses("UIDVALIDITY").last
+      nomodseq    = clear_responses("NOMODSEQ").any?
+      if uidvalidity != params.uidvalidity
+        clear_responses
+        return QResyncResult.rebuild(:uidvalidity_changed)
+      end
+      if nomodseq
+        clear_responses
+        return QResyncResult.rebuild(:nomodseq)
+      end
+
+      modseq = clear_responses("HIGHESTMODSEQ").last
+      unless modseq
+        return QResyncResult.rebuild(:modseq_unavailable)
+      end
+
+      vanished = clear_responses("VANISHED")
+      deleted  = merge_qresync_uids(vanished.select(&:earlier?))
+      live    = merge_qresync_uids(vanished.reject(&:earlier?))
+      deleted = deleted & params.known_uids if deleted.valid?
+
+      fetches_by_uid = {}
+      clear_responses("FETCH").each do |fetch|
+        uid = fetch.uid
+        next unless uid
+        next if live.include?(uid)
+        fetches_by_uid[uid] = fetch
+      end
+
+      fetched = SequenceSet.new(fetches_by_uid.keys)
+      deleted = deleted - fetched if deleted.valid?
+      known_after_deletions = SequenceSet.new(params.known_uids)
+      known_after_deletions.subtract(deleted) if deleted.valid?
+      updated_uids = fetched & known_after_deletions
+      current_uids = SequenceSet.new(known_after_deletions)
+      current_uids.merge(fetched)
+      current_uids.subtract(live) if live.valid?
+
+      updated = fetches_by_uid.values
+        .select { updated_uids.include?(_1.uid) }
+        .sort_by(&:uid)
+        .freeze
+      missing = (fetched - known_after_deletions).freeze
+
+      QResyncResult.ok(
+        deleted:  deleted,
+        updated:  updated,
+        missing:  missing,
+        vanished: live,
+        expunged: clear_responses("EXPUNGE"),
+        exists:   clear_responses("EXISTS").last,
+        checkpoint: QResyncCheckpoint.new(
+          uidvalidity: uidvalidity,
+          modseq:      modseq,
+          known_uids:  current_uids,
+        ),
+      )
+    end
+
+    def merge_qresync_uids(vanished_responses)
+      return SequenceSet.empty if vanished_responses.empty?
+      first, *rest = vanished_responses.map(&:uids)
+      SequenceSet.new(first).merge(*rest)
     end
 
     RETURN_WHOLE = /\ARETURN\z/i
