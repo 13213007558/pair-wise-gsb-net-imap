@@ -2288,9 +2288,7 @@ module Net
     # This will report the UIDVALIDITY of the destination mailbox and the
     # assigned UID of the appended message.
     #
-    #--
-    # TODO: add MULTIAPPEND support
-    #++
+    # Related: #append_multi
     def append(mailbox, message, flags = nil, date_time = nil)
       message = StringFormatter.literal_or_literal8(message, name: "message")
       args = []
@@ -2298,6 +2296,76 @@ module Net
       args.push(date_time) if date_time
       args.push(message)
       send_command("APPEND", mailbox, *args)
+    end
+
+    # Sends an {APPEND command [RFC3502 §3]}[https://www.rfc-editor.org/rfc/rfc3502#section-3]
+    # to append multiple +messages+ to the end of the +mailbox+, as a single
+    # atomic operation.  The server must advertise the +MULTIAPPEND+
+    # capability [RFC3502[https://www.rfc-editor.org/rfc/rfc3502.html]].
+    #
+    # Each entry in +messages+ is a hash with the following keys:
+    # * +message+ (required): the message text, as a String, or as an IO-like
+    #   object (responding to +read+) with a known byte length.
+    # * +flags+ (optional): an array of flags initially assigned to the
+    #   message.
+    # * +date_time+ (optional): the creation time to assign to the message;
+    #   it defaults to the current time.
+    # * +bytesize+ (optional): the exact number of bytes to read from an
+    #   IO-like +message+.  When not given, +message.size+ is used if the IO
+    #   responds to +size+; otherwise ArgumentError is raised.
+    # * +binary+ (optional): when true, an IO-like +message+ is sent as a
+    #   +literal8+ (binary literal), which requires the +BINARY+ capability
+    #   [RFC3516[https://www.rfc-editor.org/rfc/rfc3516.html]].  String
+    #   messages are sent as +literal8+ automatically when they contain
+    #   +NULL+ bytes.
+    #
+    # A bare String or IO may also be used as an entry, which is equivalent
+    # to a hash with only the +message+ key.
+    #
+    # For example:
+    #
+    #   imap.append_multi("inbox", [
+    #     {message: "Subject: one\r\n\r\nhello\r\n", flags: [:Seen]},
+    #     {message: File.open("message2.eml", "rb")},
+    #     {message: StringIO.new("Subject: three\r\n\r\nbye\r\n")},
+    #   ])
+    #
+    # IO message bodies are streamed in chunks, and each IO is only consumed
+    # after the server has allowed that message's literal.  If the server
+    # rejects the command before allowing a literal, the remaining IOs are
+    # never read.  When the server supports non-synchronizing literals
+    # (+LITERAL+ [RFC7888[https://www.rfc-editor.org/rfc/rfc7888.html]]),
+    # small literals may be sent without waiting for the server's
+    # continuation request.
+    #
+    # Returns an Array of the UIDs assigned to the appended messages, in the
+    # same order as +messages+, when the server's response includes an
+    # +APPENDUID+ response code (which requires the +UIDPLUS+ capability).
+    # Returns +nil+ when the server does not report +APPENDUID+.  An
+    # InvalidResponseError is raised when the +APPENDUID+ uid-set does not
+    # contain exactly one UID per appended message.
+    #
+    # A Net::IMAP::NoResponseError is raised if the mailbox does not exist
+    # (it is not created automatically), or if any of the message entries
+    # contain errors.  When the command is interrupted before the server
+    # confirms it, an error is raised and no UIDs are reported: the caller
+    # can never observe a partially committed batch as successful.
+    #
+    # Related: #append
+    def append_multi(mailbox, messages)
+      messages = messages.to_a
+      if messages.empty?
+        raise ArgumentError, "messages must not be empty"
+      end
+      args = []
+      messages.each do |entry|
+        message, flags, date_time = append_message_args(entry)
+        args.push(flags)     if flags
+        args.push(date_time) if date_time
+        args.push(message)
+      end
+      resp = send_command("APPEND", mailbox, *args)
+      append_uids(resp, messages.size)
     end
 
     # Sends a {CHECK command [IMAP4rev1 §6.4.1]}[https://www.rfc-editor.org/rfc/rfc3501#section-6.4.1]
@@ -3960,6 +4028,56 @@ module Net
           VanishedData[uids: merged_uids, earlier: false]
         end
       end
+    end
+
+    APPEND_MESSAGE_KEYS = %i[message flags date_time bytesize binary].freeze
+    private_constant :APPEND_MESSAGE_KEYS
+
+    # Returns [literal, flags, date_time] for one #append_multi message entry.
+    def append_message_args(entry)
+      case entry
+      when Hash
+        unknown = entry.keys - APPEND_MESSAGE_KEYS
+        unless unknown.empty?
+          raise ArgumentError, "unknown message entry keys: #{unknown.inspect}"
+        end
+        message = entry[:message] or
+          raise ArgumentError, "message entry is missing :message"
+        [append_message_literal(message, bytesize: entry[:bytesize],
+                                binary: entry[:binary] || false),
+         entry[:flags], entry[:date_time]]
+      else
+        [append_message_literal(entry), nil, nil]
+      end
+    end
+
+    def append_message_literal(message, bytesize: nil, binary: false)
+      if message.respond_to?(:read)
+        bytesize ||= message.size if message.respond_to?(:size)
+        unless bytesize
+          raise ArgumentError, "IO message bodies require a known bytesize"
+        end
+        LiteralIO.new(data: message, bytesize:, binary:)
+      else
+        StringFormatter.literal_or_literal8(message, name: "message")
+      end
+    end
+
+    # Returns the UIDs reported by the server's APPENDUID response code, in
+    # the order the messages were appended, or +nil+ when the server did not
+    # report APPENDUID.  Raises InvalidResponseError when the uid-set cannot
+    # be paired one-to-one with the appended messages.
+    def append_uids(resp, message_count)
+      code = resp.data.code
+      return nil unless code&.name == "APPENDUID"
+      uids = code.data.assigned_uids
+      uid_count = uids.count_with_duplicates
+      unless uid_count == message_count
+        raise InvalidResponseError,
+              "APPENDUID uid-set size (%d) does not match the number of " \
+              "appended messages (%d)" % [uid_count, message_count]
+      end
+      uids.each_ordered_number.to_a
     end
 
     RETURN_WHOLE = /\ARETURN\z/i

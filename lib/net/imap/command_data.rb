@@ -102,7 +102,28 @@ module Net
     # * `false` -> Force normal synchronizing literal behavior.
     # * `nil`   -> (default) Currently behaves like `false` (will be dynamic).
     def send_literal(str, tag = nil, binary: false, non_sync: nil)
-      bytesize = str.bytesize
+      send_literal_with_prefix(str.bytesize, tag, binary:, non_sync:) do
+        put_string(str)
+      end
+    end
+
+    # Streams +bytesize+ bytes from +io+ as a literal, using the same
+    # synchronizing and non-synchronizing behavior as #send_literal.
+    #
+    # The IO is only consumed after the literal prefix has been sent and (for
+    # synchronizing literals) the server has allowed the continuation.  If the
+    # server rejects the command before the continuation request, the IO is
+    # never read.
+    def send_literal_io(io, bytesize, tag = nil, binary: false, non_sync: nil)
+      send_literal_with_prefix(bytesize, tag, binary:, non_sync:) do
+        stream_literal_io(io, bytesize)
+      end
+    end
+
+    # Sends the literal prefix (+{n}+, +{n+}+, +~{n}+, or +~{n+}+), waits for
+    # the server's continuation request (unless non-synchronizing), and then
+    # yields to send the literal's octets.
+    def send_literal_with_prefix(bytesize, tag, binary:, non_sync:)
       synchronize do
         if non_sync && !non_sync_literal_allowed?(bytesize)
           # TODO: check in Printer, so we don't need to close the connection.
@@ -114,20 +135,39 @@ module Net
         prefix = "~" if binary
         plus = "+" if non_sync
         put_string("#{prefix}{#{bytesize}#{plus}}\r\n")
-        if non_sync
-          put_string(str)
-          return
-        end
+        return yield if non_sync
         @continued_command_tag = tag
         @continuation_request_exception = nil
         begin
           @continuation_request_arrival.wait
           reraise @continuation_request_exception || @exception
-          put_string(str)
+          yield
         ensure
           @continued_command_tag = nil
           @continuation_request_exception = nil
         end
+      end
+    end
+
+    LITERAL_IO_CHUNK_SIZE = 16 * 1024
+    private_constant :LITERAL_IO_CHUNK_SIZE
+
+    # Reads exactly +bytesize+ bytes from +io+, in chunks, and sends them.
+    # Raises DataFormatError and closes the connection when the IO ends
+    # before +bytesize+ bytes have been read, because the command can no
+    # longer be completed or canceled cleanly.
+    def stream_literal_io(io, bytesize)
+      remaining = bytesize
+      while remaining > 0
+        chunk = io.read([remaining, LITERAL_IO_CHUNK_SIZE].min)
+        break if chunk.nil? || chunk.empty?
+        put_string(chunk)
+        remaining -= chunk.bytesize
+      end
+      unless remaining == 0
+        @sock.close
+        raise DataFormatError, "Connection closed: " \
+          "IO ended before #{bytesize} bytes could be read"
       end
     end
 
@@ -369,6 +409,33 @@ module Net
 
       def send_data(imap, tag)
         imap.__send__(:send_binary_literal, data, tag, non_sync:)
+      end
+    end
+
+    # Represents an IMAP +literal+ (or +literal8+) whose octets are streamed
+    # from an IO-like object (responding to +read+) with a known +bytesize+.
+    #
+    # The IO is read in chunks, only while the command is being sent, and
+    # (for synchronizing literals) only after the server has sent its
+    # continuation request.  If the server rejects the command before the
+    # continuation request, the IO is never consumed.
+    class LiteralIO < Data.define(:data, :bytesize, :binary, :non_sync) # :nodoc:
+      def initialize(data:, bytesize:, binary: false, non_sync: nil)
+        data.respond_to?(:read) or
+          raise TypeError, "expected IO-like object, got #{data.class}"
+        bytesize = Integer(bytesize)
+        unless bytesize >= 0
+          raise DataFormatError, "bytesize must be non-negative: #{bytesize}"
+        end
+        super(data:, bytesize:, binary: !!binary, non_sync:)
+      end
+
+      # NOTE: the IO cannot be validated eagerly; it is consumed and
+      # validated only as the command is sent.
+      def validate = nil
+
+      def send_data(imap, tag)
+        imap.__send__(:send_literal_io, data, bytesize, tag, binary:, non_sync:)
       end
     end
 
