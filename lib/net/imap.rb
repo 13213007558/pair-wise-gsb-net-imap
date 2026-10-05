@@ -1804,6 +1804,13 @@ module Net
     # #select and all +FETCH+ responses will include FetchData#modseq.
     # Otherwise, the +NOMODSEQ+ ResponseCode will be sent.
     #
+    # When the +qresync+ keyword argument is a previous #resync checkpoint (a
+    # Hash with <tt>:uidvalidity</tt>, <tt>:highestmodseq</tt>, and
+    # <tt>:known_uids</tt> keys), and
+    # {QRESYNC}[https://www.rfc-editor.org/rfc/rfc7162.html] is supported, the
+    # server is asked to quickly resynchronize the mailbox and a QResyncResult
+    # is returned.  This is equivalent to calling #resync.
+    #
     # A Net::IMAP::NoResponseError is raised if the mailbox does not
     # exist or is for some reason non-selectable.
     #
@@ -1821,15 +1828,8 @@ module Net
     # the +condstore+ keyword parameter may be used.
     #   imap.select("mbox", condstore: true)
     #   modseq = imap.responses("HIGHESTMODSEQ", &:last)
-    def select(mailbox, condstore: false)
-      args = ["SELECT", mailbox]
-      args << ["CONDSTORE"] if condstore
-      synchronize do
-        state_unselected! # implicitly closes current mailbox
-        @responses.clear
-        send_command(*args)
-          .tap do state_selected! end
-      end
+    def select(mailbox, condstore: false, qresync: nil)
+      select_internal("SELECT", mailbox, condstore:, qresync:)
     end
 
     # Sends a {EXAMINE command [IMAP4rev1 §6.3.2]}[https://www.rfc-editor.org/rfc/rfc3501#section-6.3.2]
@@ -1841,15 +1841,62 @@ module Net
     # exist or is for some reason non-examinable.
     #
     # Related: #select
-    def examine(mailbox, condstore: false)
-      args = ["EXAMINE", mailbox]
-      args << ["CONDSTORE"] if condstore
-      synchronize do
-        state_unselected! # implicitly closes current mailbox
-        @responses.clear
-        send_command(*args)
-          .tap do state_selected! end
-      end
+    def examine(mailbox, condstore: false, qresync: nil)
+      select_internal("EXAMINE", mailbox, condstore:, qresync:)
+    end
+
+    # Quick mailbox resynchronization using the
+    # {QRESYNC}[https://www.rfc-editor.org/rfc/rfc7162.html] extension,
+    # [{RFC7162 §3.2.7}[https://www.rfc-editor.org/rfc/rfc7162.html#section-3.2.7]].
+    #
+    # +mailbox+ is selected (or examined, when +read_only+ is true) and the
+    # server is told, using a <tt>(QRESYNC uid-validity mod-sequence
+    # known-uids)</tt> parameter, exactly which messages the caller already
+    # knows about.  The +QRESYNC+ capability is {#enable enabled} first, when
+    # necessary.  The server then reports, all within the single SELECT/EXAMINE
+    # command round:
+    # * <tt>VANISHED (EARLIER)</tt> — UIDs removed before this selection,
+    # * +FETCH+ (with +MODSEQ+) — flag/modseq changes and newly arrived
+    #   messages, and
+    # * +EXISTS+ — the current message count.
+    #
+    # The required arguments come from a previously persisted checkpoint:
+    # * +uidvalidity+   — the mailbox's UIDVALIDITY,
+    # * +highestmodseq+ — the HIGHESTMODSEQ, and
+    # * +known_uids+    — the complete set of UIDs in the caller's cache.  Any
+    #   sequence-set compatible value (Integer, Range, SequenceSet, Array, …) is
+    #   accepted; it is compressed into ranges and is _never_ expanded.
+    #
+    # Returns a QResyncResult that partitions the server's report into
+    # <em>deleted</em>, <em>updated</em>, and <em>missing</em> (newly arrived or
+    # otherwise not yet cached) UIDs:
+    #   result = imap.resync("INBOX",
+    #                        uidvalidity:   checkpoint[:uidvalidity],
+    #                        highestmodseq: checkpoint[:highestmodseq],
+    #                        known_uids:    checkpoint[:known_uids])
+    #   remove_messages(result.deleted_uids)
+    #   update_flags(result.updated)
+    #   fetch_full_messages(result.missing_uids)
+    #   persist_checkpoint(result.checkpoint)
+    #
+    # When the mailbox's UIDVALIDITY has changed, or the server does not
+    # support persistent mod-sequences for the mailbox (it returns
+    # +NOMODSEQ+), the caller's cached UIDs cannot be reused and a
+    # QResyncRebuildRequired is raised: discard the local cache and rebuild it
+    # from scratch (e.g. with a full #uid_fetch).  The old checkpoint is left
+    # untouched on failure; a new QResyncResult#checkpoint is produced _only_
+    # after the command completes successfully.
+    #
+    # See also #select and #examine, which accept a <tt>qresync:</tt> keyword.
+    def resync(mailbox, uidvalidity:, highestmodseq:, known_uids:,
+               read_only: false)
+      checkpoint = {
+        uidvalidity:   uidvalidity,
+        highestmodseq: highestmodseq,
+        known_uids:    known_uids,
+      }
+      command = read_only ? "EXAMINE" : "SELECT"
+      select_internal(command, mailbox, qresync: checkpoint)
     end
 
     # Sends a {CREATE command [IMAP4rev1 §6.3.3]}[https://www.rfc-editor.org/rfc/rfc3501#section-6.3.3]
@@ -3960,6 +4007,132 @@ module Net
           VanishedData[uids: merged_uids, earlier: false]
         end
       end
+    end
+
+    def select_internal(command, mailbox, condstore:, qresync:)
+      checkpoint = normalize_qresync_checkpoint(qresync)
+      synchronize do
+        state_unselected! # implicitly closes current mailbox
+        @responses.clear
+        # ENABLE QRESYNC and SELECT/EXAMINE must be issued before any of the
+        # resync responses are consumed, so the mailbox selection and the
+        # negotiation happen within this same locked section.
+        enable_qresync! if checkpoint
+        args = [command, mailbox]
+        params = []
+        params << "CONDSTORE" if condstore
+        params.concat(qresync_param(checkpoint)) if checkpoint
+        args << params unless params.empty?
+        tagged = send_command(*args)
+        # The mailbox selection itself succeeded before a rebuild is decided,
+        # so the connection state is updated regardless of the result.
+        state_selected!
+        checkpoint ? build_qresync_result(checkpoint) : tagged
+      end
+    end
+
+    def normalize_qresync_checkpoint(qresync)
+      return nil if qresync.nil? || qresync == true
+      qresync = qresync.to_h if qresync.respond_to?(:to_h) && !qresync.is_a?(Hash)
+      Hash.try_convert(qresync) or
+        raise ArgumentError, "qresync must be a checkpoint Hash or nil, " \
+                            "got #{qresync.class}"
+      uidvalidity   = qresync.fetch(:uidvalidity)
+      highestmodseq = qresync.fetch(:highestmodseq)
+      known_uids    = qresync.fetch(:known_uids)
+      uidvalidity   = Integer(uidvalidity)
+      highestmodseq = Integer(highestmodseq)
+      known_uids    = SequenceSet[known_uids]
+      if uidvalidity.negative? || highestmodseq.negative?
+        raise ArgumentError, "uidvalidity and highestmodseq must be unsigned"
+      end
+      known_uids.validate
+      {uidvalidity:, highestmodseq:, known_uids:}
+    rescue KeyError => error
+      raise ArgumentError, "qresync checkpoint is missing #{error.key}"
+    end
+
+    # Negotiates the QRESYNC capability before a resync selection.  QRESYNC
+    # implicitly enables CONDSTORE on the server.  A server that rejects or
+    # cannot negotiate the extension makes the following SELECT fail, leaving
+    # any previous checkpoint untouched.
+    def enable_qresync!
+      enable("QRESYNC") unless enabled?("QRESYNC")
+    end
+
+    # Builds the RFC7162 select-params list content.  It is serialized by
+    # send_data as one parenthesized list:
+    #   ( QRESYNC ( uid-validity mod-sequence known-uids ) )
+    # known-uids is sent as a single SequenceSet (compressed to ranges).
+    def qresync_param(checkpoint)
+      group = [
+        checkpoint[:uidvalidity],
+        checkpoint[:highestmodseq],
+        checkpoint[:known_uids],
+      ]
+      ["QRESYNC", group]
+    end
+
+    # Processes every FETCH, VANISHED, and EXISTS response that arrived during
+    # the SELECT/EXAMINE and reduces them to one QResyncResult.  Only called
+    # after the tagged OK, so a failed command never produces a checkpoint.
+    def build_qresync_result(checkpoint)
+      server_uidvalidity = (@responses["UIDVALIDITY"].last)
+      if server_uidvalidity &&
+         server_uidvalidity != checkpoint[:uidvalidity]
+        raise QResyncRebuildRequired.new(
+          "UIDVALIDITY changed (was #{checkpoint[:uidvalidity]}, " \
+          "now #{server_uidvalidity}); local cache must be rebuilt",
+          uidvalidity: server_uidvalidity,
+        )
+      end
+
+      response_codes = @responses
+      nomodseq = response_codes.key?("NOMODSEQ") ||
+                 response_codes["HIGHESTMODSEQ"].empty?
+      if nomodseq
+        raise QResyncRebuildRequired.new(
+          "server returned NOMODSEQ; mod-sequences are unavailable and " \
+          "the local cache must be rebuilt",
+          uidvalidity: server_uidvalidity,
+        )
+      end
+      highestmodseq = response_codes["HIGHESTMODSEQ"].last
+
+      known_uids = checkpoint[:known_uids]
+
+      # VANISHED (EARLIER) lists removals that predate this selection.
+      # VANISHED without EARLIER (or EXPUNGE, which QRESYNC replaces) lists
+      # removals during this very session.  Both identify *UIDs* here (unlike
+      # EXPUNGE, which uses message sequence numbers); merge them all.
+      deleted = SequenceSet.new
+      extract_responses("VANISHED") do |vanished|
+        deleted.merge(vanished.uids)
+        true
+      end
+
+      updated = []
+      missing = SequenceSet.new
+      # Out-of-order FETCH responses are simply grouped by UID; the result is
+      # independent of response order.
+      extract_responses("FETCH") do |fetch|
+        uid = fetch.uid
+        if uid && !known_uids.cover?(uid)
+          missing.merge(uid)      # new/uncached: needs a full UID FETCH
+        else
+          updated << fetch        # cached: apply flag/modseq change
+        end
+        true
+      end
+
+      QResyncResult.new(
+        uidvalidity:   server_uidvalidity,
+        highestmodseq: highestmodseq,
+        deleted_uids:  deleted,
+        updated:       updated,
+        missing_uids:  missing,
+        exists:        @responses["EXISTS"].last,
+      )
     end
 
     RETURN_WHOLE = /\ARETURN\z/i

@@ -364,6 +364,25 @@ module Net
     class UnknownResponseError < ResponseError
     end
 
+    # Error raised when a mailbox cannot be quick resynchronized from a
+    # previous QRESYNC checkpoint and the caller's local cache must instead be
+    # fully rebuilt.  See {RFC7162}[https://www.rfc-editor.org/rfc/rfc7162.html]
+    # and Net::IMAP#resync.
+    #
+    # This happens when:
+    # * the mailbox's UIDVALIDITY has changed since the checkpoint, or
+    # * the mailbox no longer supports persistent mod-sequences (the server
+    #   returned a +NOMODSEQ+ response code or no HIGHESTMODSEQ).
+    class QResyncRebuildRequired < Error
+      # The UIDVALIDITY returned by the server, when available.
+      attr_reader :uidvalidity
+
+      def initialize(message = nil, uidvalidity: nil)
+        @uidvalidity = uidvalidity
+        super(message || "mailbox must be fully rebuilt; QRESYNC resync is not possible")
+      end
+    end
+
     RESPONSE_ERRORS = Hash.new(ResponseError) # :nodoc:
     RESPONSE_ERRORS["NO"] = NoResponseError
     RESPONSE_ERRORS["BAD"] = BadResponseError
