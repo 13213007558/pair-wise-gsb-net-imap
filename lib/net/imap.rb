@@ -927,7 +927,6 @@ module Net
   #
   # ==== For currently unsupported features:
   # * {LIST-EXTENDED options and responses}[https://www.iana.org/assignments/imap-list-extended/imap-list-extended.xhtml]
-  # * {IMAP METADATA Server Entry and Mailbox Entry Registries}[https://www.iana.org/assignments/imap-metadata/imap-metadata.xhtml]
   # * {IMAP ANNOTATE Extension Entries and Attributes}[https://www.iana.org/assignments/imap-annotate-extension/imap-annotate-extension.xhtml]
   # * {IMAP URLAUTH Access Identifiers and Prefixes}[https://www.iana.org/assignments/urlauth-access-ids/urlauth-access-ids.xhtml]
   # * {IMAP URLAUTH Authorization Mechanism Registry}[https://www.iana.org/assignments/urlauth-authorization-mechanism-registry/urlauth-authorization-mechanism-registry.xhtml]
@@ -2253,6 +2252,78 @@ module Net
         send_command("STATUS", mailbox, attr)
         clear_responses("STATUS").last&.attr
       end
+    end
+
+    # :call-seq:
+    #   getmetadata(mailbox, *entries, depth: nil, maxsize: nil) -> hash
+    #
+    # Sends a {GETMETADATA command [RFC5464 §4.2]}[https://www.rfc-editor.org/rfc/rfc5464#section-4.2]
+    # and returns metadata for a server entry or a mailbox entry.
+    #
+    # Use the empty string (or +nil+) as +mailbox+ to retrieve server
+    # metadata. Returns a hash of entry names to entry values. Values are
+    # returned as binary strings. A +nil+ value means the server omitted the
+    # value (for example, because it exceeded +maxsize+).
+    #
+    # +depth+ may be +0+ (the default), +1+, or +:infinity+; +maxsize+ limits
+    # each returned entry to the given number of bytes. Both options are sent
+    # structurally in an options list, e.g. <tt>(DEPTH infinity MAXSIZE 1024)</tt>.
+    #
+    # Untagged +METADATA+ responses for other mailboxes, which may be sent by
+    # the server concurrently with this command, remain in #responses and are
+    # not included in this command's return value.
+    #
+    # Limits are retained on the tagged response's ResponseCode as
+    # <tt>METADATA (LONGENTRIES n)</tt>, <tt>METADATA (MAXSIZE n)</tt>,
+    # <tt>METADATA (TOOMANY)</tt>, <tt>METADATA (TOOBIG)</tt>, or
+    # <tt>METADATA (PRIVATE)</tt>.
+    #
+    # Requires the +METADATA+ capability.
+    def getmetadata(mailbox, *entries, depth: nil, maxsize: nil)
+      mailbox = mailbox.nil? ? "" : convert_metadata_name(mailbox, "mailbox")
+      entries = entries.flatten
+      raise ArgumentError, "at least one entry is required" if entries.empty?
+      entries.each do |entry|
+        convert_metadata_name(entry, "entry")
+      end
+      args = [mailbox]
+      options = metadata_get_options(depth: depth, maxsize: maxsize)
+      args << options if options
+      args.concat(entries)
+      synchronize do
+        target = mailbox
+        matching = []
+        send_command("GETMETADATA", *args) do |response|
+          data = response.is_a?(UntaggedResponse) ? response.data : nil
+          if data.is_a?(MetadataData) && data.mailbox == target
+            matching << data
+          end
+        end
+        matching.each { @responses["METADATA"]&.delete(_1) }
+        matching.each_with_object({}) { _2.update(_1.entries) }
+      end
+    end
+
+    # Sends a {SETMETADATA command [RFC5464 §4.3]}[https://www.rfc-editor.org/rfc/rfc5464#section-4.3]
+    # to set or delete metadata entries on a server entry or a mailbox entry.
+    #
+    # Use the empty string (or +nil+) as +mailbox+ to set server metadata.
+    # +entries+ maps entry names to values. A value of +nil+ deletes the entry,
+    # an empty string sets an empty value as <tt>""</tt>, and a Literal (or
+    # Literal8) empty string sets the value using a literal. Other strings may
+    # contain arbitrary bytes. Values may also be Literal or Literal8 objects
+    # to force literal encoding.
+    #
+    # Requires the +METADATA+ capability.
+    def setmetadata(mailbox, entries)
+      mailbox = mailbox.nil? ? "" : convert_metadata_name(mailbox, "mailbox")
+      entries = entries.to_h unless entries.is_a?(Hash)
+      raise ArgumentError, "at least one entry is required" if entries.empty?
+      entry_values = entries.flat_map do |entry, value|
+        entry = convert_metadata_name(entry, "entry")
+        [entry, metadata_entry_value(value)]
+      end
+      send_command("SETMETADATA", mailbox, entry_values)
     end
 
     # Sends an {APPEND command [IMAP4rev1 §6.3.11]}[https://www.rfc-editor.org/rfc/rfc3501#section-6.3.11]
@@ -4013,6 +4084,45 @@ module Net
         else                             opt
         end
       }
+    end
+
+    def metadata_get_options(depth:, maxsize:)
+      options = []
+      unless depth.nil?
+        depth_value =
+          case depth
+          when :infinity, "infinity", "INFINITY" then "infinity"
+          else Integer(depth)
+          end
+        unless depth_value == 0 || depth_value == 1 || depth_value == "infinity"
+          raise ArgumentError, "depth must be 0, 1, or :infinity"
+        end
+        options.concat(["DEPTH", depth_value])
+      end
+      unless maxsize.nil?
+        maxsize = Integer(maxsize)
+        raise ArgumentError, "maxsize must not be negative" if maxsize.negative?
+        options.concat(["MAXSIZE", maxsize])
+      end
+      options
+    end
+
+    def convert_metadata_name(value, argument)
+      String.try_convert(value) or
+        raise TypeError, "#{argument} must be a String, got #{value.class}"
+    end
+
+    def metadata_entry_value(value)
+      case value
+      when nil
+        nil
+      when Literal, Literal8
+        value
+      when String
+        value.include?("\0") ? Literal8.new(data: value) : value
+      else
+        raise TypeError, "value must be a String, got #{value.class}"
+      end
     end
 
     def search_internal(cmd, ...)

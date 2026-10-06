@@ -800,10 +800,65 @@ module Net
 
       alias listrights_data         response_data__unhandled
       alias myrights_data           response_data__unhandled
-      alias metadata_resp           response_data__unhandled
       alias language_data           response_data__unhandled
       alias comparator_data         response_data__unhandled
       alias message_data__converted response_data__unhandled
+
+      # RFC5464:
+      #   metadata-resp = "METADATA" SP mailbox SP entry-list
+      #   entry-list    = 1*SP (entry SP entry-value)
+      def metadata_resp
+        name = label("METADATA")
+        SP!
+        mailbox = astring
+        SP!
+        # Consume the opening "(" without retaining the preceding SP token in
+        # the lookahead; entry values below are parsed around literal prefixes.
+        @token = nil
+        @pos += 1
+        entries = {}
+        while @str.getbyte(@pos) != ")".ord
+          @pos += 1 if @str.getbyte(@pos) == " ".ord
+          start = @pos
+          @pos += 1 while @str.getbyte(@pos) != " ".ord
+          entry = @str.byteslice(start...@pos)
+          @pos += 1
+          value = metadata_entry_value
+          entries[entry] = value
+        end
+        @pos += 1 # consume ")"
+        UntaggedResponse.new(name, MetadataData.new(mailbox, entries), @str)
+      end
+
+      def metadata_entry_value
+        if @str.getbyte(@pos) == '"'.ord
+          start = @pos
+          match = Patterns::QUOTED_rev2.match(@str, start) or
+            parse_error("invalid metadata quoted string")
+          @pos = match.end(0)
+          return Patterns.unescape_quoted(match[1])&.b
+        end
+        next_byte = @str.getbyte(@pos + 3)
+        if @str.byteslice(@pos, 3) == "NIL" &&
+             [" ".ord, ")".ord].include?(next_byte)
+          @pos += 3
+          return nil
+        end
+        @pos += 1 while @str.getbyte(@pos) == " ".ord
+        tilde = @str.getbyte(@pos) == "~".ord
+        @pos += 1 if tilde
+        unless @str.byteslice(@pos, 1) == "{"
+          parse_error("invalid metadata literal")
+        end
+        start = @pos + 1
+        ending = start
+        ending += 1 until @str.getbyte(ending) == "}".ord
+        size = Integer(@str.byteslice(start...ending))
+        @pos = ending + 3
+        value = @str.byteslice(@pos, size).b
+        @pos += size
+        value
+      end
 
       # RFC3501 & RFC9051:
       #   response-tagged = tag SP resp-cond-state CRLF
@@ -1985,6 +2040,7 @@ module Net
           when "HIGHESTMODSEQ"      then SP!; mod_sequence_value   # CONDSTORE
           when "MODIFIED"           then SP!; sequence_set         # CONDSTORE
           when "MAILBOXID"          then SP!; parens__objectid     # RFC8474: OBJECTID
+          when "METADATA"           then SP!; metadata_response_code # RFC5464
           when "UIDREQUIRED"        then                           # RFC9586: UIDONLY
           else
             state = nil # don't backtrack
@@ -2003,6 +2059,26 @@ module Net
       end
 
       alias resp_text_code__name case_insensitive__atom
+
+      # RFC5464:
+      #   metadata-response-code = "LONGENTRIES" SP number /
+      #                             "MAXSIZE" SP number /
+      #                             "TOOMANY" / "TOOBIG" / "PRIVATE"
+      def metadata_response_code
+        nested = lpar?
+        name = resp_text_code__name
+        data = case name
+               when "LONGENTRIES", "MAXSIZE"
+                 SP!
+                 number
+               when "TOOMANY", "TOOBIG", "PRIVATE"
+                 nil
+               else
+                 parse_error("unexpected metadata response code %p", name)
+               end
+        rpar if nested
+        ResponseCode.new(name, data)
+      end
 
       # 1*<any TEXT-CHAR except "]">
       def text_chars_except_rbra
@@ -2213,7 +2289,7 @@ module Net
             if $1
               return Token.new(T_SPACE, $+)
             elsif $2
-              literal_token($+, T_LITERAL8)
+              literal_token($2, T_LITERAL8)
             elsif $3 && $7
               # greedily match ATOM, prefixed with NUMBER, NIL, or PLUS.
               return Token.new(T_ATOM, $3)
@@ -2227,7 +2303,7 @@ module Net
               # match ATOM, without a NUMBER, NIL, or PLUS prefix
               return Token.new(T_ATOM, $+)
             elsif $9
-              return Token.new(T_QUOTED, Patterns.unescape_quoted($+))
+              return Token.new(T_QUOTED, Patterns.unescape_quoted($9))
             elsif $10
               return Token.new(T_LPAR, $+)
             elsif $11
@@ -2241,7 +2317,7 @@ module Net
             elsif $15
               return Token.new(T_RBRA, $+)
             elsif $16
-              literal_token($+)
+              literal_token($16)
             elsif $17
               return Token.new(T_PERCENT, $+)
             elsif $18
@@ -2265,9 +2341,9 @@ module Net
             elsif $3
               return Token.new(T_NUMBER, $+)
             elsif $4
-              return Token.new(T_QUOTED, Patterns.unescape_quoted($+))
+              return Token.new(T_QUOTED, Patterns.unescape_quoted($4))
             elsif $5
-              literal_token($+)
+              literal_token($5)
             elsif $6
               return Token.new(T_LPAR, $+)
             elsif $7

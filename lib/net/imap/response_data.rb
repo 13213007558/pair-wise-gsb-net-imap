@@ -626,6 +626,24 @@ module Net
       # "UIDVALIDITY", "UNSEEN". Each value is a number.
     end
 
+    # MetadataData represents the contents of an untagged +METADATA+
+    # response [RFC5464].
+    #
+    # IMAP#getmetadata returns the contents of #entries.
+    class MetadataData < Struct.new(:mailbox, :entries)
+      # The mailbox the metadata belongs to, or the empty string for server
+      # metadata.
+      #
+      # :call-seq: mailbox -> string
+
+      # A hash of metadata entry names and values.
+      #
+      # A +nil+ value represents a value omitted by the server. Other entry
+      # values are binary strings, preserving every byte sent by the server.
+      #
+      # :call-seq: entries -> Hash[String, String]
+    end
+
     # Net::IMAP::Envelope represents envelope structures of messages.
     #
     # [Note]
