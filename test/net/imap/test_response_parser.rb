@@ -192,6 +192,34 @@ class ResponseParserTest < Net::IMAP::TestCase
     Net::IMAP.debug = debug
   end
 
+  test "RFC 5464 METADATA responses and response codes" do
+    parser = Net::IMAP::ResponseParser.new
+
+    response = parser.parse(
+      "* METADATA \"\" (/shared/comment {9}\r\n(a) b\x00(c) /nil NIL)\r\n".b
+    )
+    assert_equal "", response.data.mailbox
+    assert_equal "(a) b\x00(c)".b, response.data.entries["/shared/comment"]
+    assert_nil response.data.entries["/nil"]
+    assert_empty response.data.omitted
+
+    response = parser.parse(
+      "* METADATA INBOX (/kept \"value\" /too-long /missing)\r\n"
+    )
+    assert_equal "INBOX", response.data.mailbox
+    assert_equal "value", response.data.entries["/kept"]
+    assert_equal ["/too-long", "/missing"], response.data.omitted
+    assert_nil response.data.entries["/too-long"]
+
+    response = parser.parse("A1 OK [LONGENTRIES 2] limits\r\n")
+    assert_equal "LONGENTRIES", response.data.code.name
+    assert_equal 2, response.data.code.data
+
+    response = parser.parse("A2 NO [MAXSIZE 10240] too large\r\n")
+    assert_equal "MAXSIZE", response.data.code.name
+    assert_equal 10_240, response.data.code.data
+  end
+
   test "APPENDUID with '*'" do
     parser = Net::IMAP::ResponseParser.new
     assert_raise_with_message Net::IMAP::ResponseParseError, /uid-set cannot contain '\*'/ do

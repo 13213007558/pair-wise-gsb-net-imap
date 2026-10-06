@@ -869,6 +869,10 @@ module Net
   #   Crispin, M. and K. Murchison, "Internet Message Access Protocol - SORT and
   #   THREAD Extensions", RFC 5256, DOI 10.17487/RFC5256, June 2008,
   #   <https://www.rfc-editor.org/info/rfc5256>.
+  # [METADATA[https://www.rfc-editor.org/rfc/rfc5464]]::
+  #   Daboo, C., "The IMAP METADATA Extension", RFC 5464,
+  #   DOI 10.17487/RFC5464, February 2009,
+  #   <https://www.rfc-editor.org/info/rfc5464>.
   # [THREAD[https://www.rfc-editor.org/rfc/rfc5256]]::
   #   Crispin, M. and K. Murchison, "Internet Message Access Protocol - SORT and
   #   THREAD Extensions", RFC 5256, DOI 10.17487/RFC5256, June 2008,
@@ -927,7 +931,6 @@ module Net
   #
   # ==== For currently unsupported features:
   # * {LIST-EXTENDED options and responses}[https://www.iana.org/assignments/imap-list-extended/imap-list-extended.xhtml]
-  # * {IMAP METADATA Server Entry and Mailbox Entry Registries}[https://www.iana.org/assignments/imap-metadata/imap-metadata.xhtml]
   # * {IMAP ANNOTATE Extension Entries and Attributes}[https://www.iana.org/assignments/imap-annotate-extension/imap-annotate-extension.xhtml]
   # * {IMAP URLAUTH Access Identifiers and Prefixes}[https://www.iana.org/assignments/urlauth-access-ids/urlauth-access-ids.xhtml]
   # * {IMAP URLAUTH Authorization Mechanism Registry}[https://www.iana.org/assignments/urlauth-authorization-mechanism-registry/urlauth-authorization-mechanism-registry.xhtml]
@@ -2253,6 +2256,71 @@ module Net
         send_command("STATUS", mailbox, attr)
         clear_responses("STATUS").last&.attr
       end
+    end
+
+    # Sends a GETMETADATA command [RFC5464] and returns a GetMetadataResult.
+    #
+    # Use the empty string as +mailbox+ to retrieve server entries.  One or
+    # more metadata +entries+ may be requested.  +depth+ may be +0+, +1+, or
+    # +:infinity+; +maxsize+ limits the byte size of values returned by the
+    # server.
+    #
+    # Entries omitted because they exceeded +maxsize+ remain present in the
+    # returned hash with +nil+ values and are also listed in
+    # GetMetadataResult#omitted.  Unsolicited METADATA responses for other
+    # mailboxes are not included in the return value.
+    def getmetadata(mailbox, *entries, depth: nil, maxsize: nil)
+      entries = entries.flatten
+      entries.empty? and raise ArgumentError, "at least one entry is required"
+      entries.map! { _1.to_s }
+      options = []
+      unless depth.nil?
+        depth = case depth
+                when 0, 1 then depth
+                when Float::INFINITY, :infinity, "infinity" then "infinity"
+                else raise ArgumentError, "invalid depth: #{depth.inspect}"
+                end
+        options.concat(["DEPTH", depth])
+      end
+      unless maxsize.nil?
+        maxsize = NumValidator.coerce_number64(maxsize)
+        options.concat(["MAXSIZE", maxsize])
+      end
+      args = [mailbox]
+      args << options unless options.empty?
+      args.concat(entries)
+      synchronize do
+        metadata = []
+        tagged = send_command("GETMETADATA", *args) do |response|
+          if response.is_a?(UntaggedResponse) &&
+             response.name == "METADATA" &&
+             response.data in MetadataData(mailbox: ^mailbox)
+            metadata << response.data
+          end
+        end
+        returned_entries = metadata.each_with_object({}) { _2.update(_1.entries) }
+        omitted = metadata.flat_map(&:omitted)
+        code = tagged.data.code
+        longentries = code.data if code&.name == "LONGENTRIES"
+        GetMetadataResult.new(mailbox:, entries: returned_entries, omitted:, depth:,
+                              maxsize:, longentries:)
+      end
+    end
+
+    # Sends a SETMETADATA command [RFC5464].
+    #
+    # Use the empty string as +mailbox+ to set server entries.  Multiple
+    # entry/value pairs can be sent atomically by passing a hash.  A +nil+
+    # value deletes an entry, an empty string stores an empty value, and a
+    # Literal or Literal8 value is sent as a literal.  Other strings are sent
+    # using the most compact valid representation.
+    def setmetadata(mailbox, entry, value = unset = true)
+      entries = unset.equal?(true) ? entry.to_h : {entry => value}
+      entries.empty? and raise ArgumentError, "at least one entry is required"
+      entry_values = entries.flat_map do |name, entry_value|
+        [name.to_s, format_metadata_value(entry_value)]
+      end
+      send_command("SETMETADATA", mailbox, entry_values)
     end
 
     # Sends an {APPEND command [IMAP4rev1 §6.3.11]}[https://www.rfc-editor.org/rfc/rfc3501#section-6.3.11]
@@ -4077,6 +4145,24 @@ module Net
       args << ["UNCHANGEDSINCE", Integer(unchangedsince)] if unchangedsince
       args << attr << flags
       send_command_returning_fetch_results(cmd, *args)
+    end
+
+    def format_metadata_value(value)
+      case value
+      when nil, Literal, Literal8
+        value
+      else
+        string = String.try_convert(value) or
+          raise TypeError,
+                "expected metadata value to be a String, nil, Literal, or Literal8"
+        if string.empty?
+          QuotedString.new(data: string)
+        elsif string.b.match?(StringFormatter::LITERAL_REGEX)
+          StringFormatter.literal_or_literal8(string, name: "metadata value")
+        else
+          string
+        end
+      end
     end
 
     def send_command_returning_fetch_results(...)

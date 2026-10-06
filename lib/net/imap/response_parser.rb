@@ -800,10 +800,53 @@ module Net
 
       alias listrights_data         response_data__unhandled
       alias myrights_data           response_data__unhandled
-      alias metadata_resp           response_data__unhandled
       alias language_data           response_data__unhandled
       alias comparator_data         response_data__unhandled
       alias message_data__converted response_data__unhandled
+
+      # RFC5464:
+      #   metadata-resp   = "METADATA" SP mailbox SP
+      #                     (entry-values / entry-matchr)
+      #   entry-values    = "(" 1#(entry SP value) ")"
+      #   entry-matchr    = "(" 1#entry ")"
+      #   value           = nstring / literal8
+      def metadata_resp
+        resp_name = label("METADATA")
+        SP!
+        mailbox_name = mailbox
+        SP!
+        lpar
+        entries = {}
+        omitted = []
+        loop do
+          entry = metadata_entry
+          break unless SP?
+          case @token&.symbol
+          when :NIL, :QUOTED, :LITERAL, :LITERAL8
+            entries[entry] =
+              if @token&.symbol == :NIL
+                accept(:NIL)
+                nil
+              else
+                string8
+              end
+            break if lookahead_rpar?
+            SP!
+          else
+            omitted << entry
+            break unless SP?
+          end
+        end
+        rpar
+        UntaggedResponse.new(resp_name,
+                             MetadataData.new(mailbox_name, entries, omitted),
+                             @str)
+      end
+
+      def metadata_entry
+        tokens = ASTRING_CHARS_TOKENS - [T_NIL]
+        lookahead?(*tokens) ? astring_chars : string!
+      end
 
       # RFC3501 & RFC9051:
       #   response-tagged = tag SP resp-cond-state CRLF
@@ -1960,6 +2003,10 @@ module Net
       # RFC8474: OBJECTID
       #   resp-text-code   =/ "MAILBOXID" SP "(" objectid ")"
       #
+      # RFC5464: METADATA
+      #   resp-text-code   =/ "LONGENTRIES" SP max-sizedent /
+      #                     "MAXSIZE" SP max-size
+      #
       # RFC9586: UIDONLY
       #   resp-text-code   =/ "UIDREQUIRED"
       def resp_text_code
@@ -1985,6 +2032,8 @@ module Net
           when "HIGHESTMODSEQ"      then SP!; mod_sequence_value   # CONDSTORE
           when "MODIFIED"           then SP!; sequence_set         # CONDSTORE
           when "MAILBOXID"          then SP!; parens__objectid     # RFC8474: OBJECTID
+          when "LONGENTRIES"        then SP!; number              # RFC5464
+          when "MAXSIZE"            then SP!; number              # RFC5464
           when "UIDREQUIRED"        then                           # RFC9586: UIDONLY
           else
             state = nil # don't backtrack
