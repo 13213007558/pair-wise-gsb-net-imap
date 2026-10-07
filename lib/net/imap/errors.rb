@@ -21,6 +21,10 @@ module Net
     class ResponseReadError < Error
     end
 
+    # Error raised when the compressed connection cannot be read.
+    class CompressionError < ResponseReadError
+    end
+
     # Error raised when a response is larger than IMAP#max_response_size.
     class ResponseTooLargeError < ResponseReadError
       attr_reader :bytes_read, :literal_size

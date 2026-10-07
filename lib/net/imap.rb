@@ -15,6 +15,7 @@
 
 require "socket"
 require "monitor"
+require "zlib"
 require 'net/protocol'
 begin
   require "openssl"
@@ -948,6 +949,7 @@ module Net
 
     dir = File.expand_path("imap", __dir__)
     autoload :ConnectionState,        "#{dir}/connection_state"
+    autoload :ConnectionIO,           "#{dir}/connection_io"
     autoload :ResponseReader,         "#{dir}/response_reader"
     autoload :SASL,                   "#{dir}/sasl"
     autoload :SASLAdapter,            "#{dir}/sasl_adapter"
@@ -1272,7 +1274,7 @@ module Net
       @logout_command_tag = nil
 
       # Connection
-      @sock = tcp_socket(@host, @port)
+      @sock = build_connection_io(tcp_socket(@host, @port))
       @reader = ResponseReader.new(self, @sock)
       start_tls_session if ssl_ctx
       start_imap_connection
@@ -1342,7 +1344,14 @@ module Net
     # This only indicates that TLS negotiation has started.
     #
     # See #tls_verified?
-    def tls_socket?; @sock.kind_of?(OpenSSL::SSL::SSLSocket) end
+    def tls_socket?
+      @sock.respond_to?(:tls_socket?) ? @sock.tls_socket? : false
+    end
+
+    # Returns +true+ when the connection is using compression.
+    def compressed?
+      @sock.respond_to?(:compressed?) && @sock.compressed?
+    end
 
     # Disconnects from the server.
     #
@@ -1636,6 +1645,42 @@ module Net
               ]
       end
       ok
+    end
+
+    # Sends a {COMPRESS=DEFLATE command [RFC4978]}
+    # [https://www.rfc-editor.org/rfc/rfc4978] to enable DEFLATE compression.
+    #
+    # After the server accepts the command, all subsequent client commands and
+    # server responses, including #idle and literals, use the same compressed
+    # stream.
+    #
+    # If the server rejects compression, the connection remains uncompressed
+    # and usable.
+    #
+    # ==== Capability
+    # The server must advertise +COMPRESS=DEFLATE+ before calling this method.
+    def compress(algorithm = "DEFLATE")
+      unless algorithm.to_s.upcase == "DEFLATE"
+        raise ArgumentError, "unsupported compression algorithm: #{algorithm}"
+      end
+      synchronize do
+        if compressed?
+          raise Error, "compression is already enabled"
+        elsif connection_state.to_sym == :not_authenticated
+          raise Error, "COMPRESS is only allowed after authentication"
+        elsif connection_state.to_sym == :logout || disconnected?
+          raise Error, "connection has been closed"
+        elsif @idle_done_cond
+          raise Error, "COMPRESS is not allowed while IDLE is active"
+        end
+      end
+      synchronize do
+        send_command("COMPRESS", algorithm) do |response|
+          if response.kind_of?(TaggedResponse) && response.name == "OK"
+            @sock.start_compression
+          end
+        end
+      end
     end
 
     # :call-seq:
@@ -3396,11 +3441,10 @@ module Net
       synchronize do
         tag = Thread.current[:net_imap_tag] = generate_tag
         command = Command[tag:, name: "IDLE"]
-        put_string("#{tag} IDLE#{CRLF}")
-        finish_sending_command(command)
-
         begin
           add_response_handler(&response_handler)
+          put_string("#{tag} IDLE#{CRLF}", flush: true)
+          finish_sending_command(command)
           @idle_done_cond = new_cond
           @idle_done_cond.wait(timeout)
           @idle_done_cond = nil
@@ -3410,7 +3454,7 @@ module Net
         ensure
           remove_response_handler(response_handler)
           unless @receiver_thread_terminating
-            put_string("DONE#{CRLF}")
+            put_string("DONE#{CRLF}", flush: true)
             response = get_tagged_response(tag, "IDLE", idle_response_timeout)
           end
         end
@@ -3707,6 +3751,10 @@ module Net
         "#{host}:#{port} (exceeds #{open_timeout} seconds)"
     end
 
+    def build_connection_io(io)
+      ConnectionIO.new(io)
+    end
+
     def receive_responses
       exception = nil
       loop do
@@ -3740,8 +3788,16 @@ module Net
     end
 
     def get_response
+      read_and_parse_response
+    end
+
+    def read_and_parse_response
       buff = @reader.read_response_buffer
       return nil if buff.length == 0
+      parse_response_buffer(buff)
+    end
+
+    def parse_response_buffer(buff)
       $stderr.print(buff.gsub(/^/n, "S: ")) if config.debug?
       @parser.parse(buff)
     end
@@ -3830,16 +3886,16 @@ module Net
       synchronize do
         tag = generate_tag
         command = Command[tag:, name: cmd]
-        put_string(tag + " " + cmd)
+        put_string(tag + " " + cmd, flush: false)
         args.each do |i|
-          put_string(" ")
-          send_data(i, tag)
+          put_string(" ", flush: false)
+          send_data(i, tag, flush: false)
         end
         @logout_command_tag = tag if cmd == "LOGOUT"
         finish_sending_command(command)
         add_response_handler(&block) if block
         begin
-          put_string(CRLF)
+          put_string(CRLF, flush: true)
           get_tagged_response(tag, cmd)
         ensure
           remove_response_handler(block) if block
@@ -3923,18 +3979,28 @@ module Net
       return format("%s%04d", @tag_prefix, @tagno)
     end
 
-    def put_string(str)
-      @sock.print(str)
-      if config.debug?
-        if @debug_output_bol
-          $stderr.print("C: ")
-        end
-        $stderr.print(str.gsub(/\n/n) { $'.empty? ? $& : "\nC: " })
-        if /\n\z/n.match(str)
-          @debug_output_bol = true
+    def put_string(str, flush: true)
+      begin
+        reraise @exception if compressed? && @receiver_thread_terminating
+        if flush == :now
+          @sock.print_flush_buffer(str)
         else
-          @debug_output_bol = false
+          @sock.print(str, flush:)
         end
+        if config.debug?
+          if @debug_output_bol
+            $stderr.print("C: ")
+          end
+          $stderr.print(str.gsub(/\n/n) { $'.empty? ? $& : "\nC: " })
+          if /\n\z/n.match(str)
+            @debug_output_bol = true
+          else
+            @debug_output_bol = false
+          end
+        end
+      rescue IOError
+        raise unless compressed?
+        reraise @exception
       end
     end
 
@@ -4153,16 +4219,19 @@ module Net
 
     def start_tls_session
       raise "SSL extension not installed" unless defined?(OpenSSL::SSL)
-      raise "already using SSL" if @sock.kind_of?(OpenSSL::SSL::SSLSocket)
+      raise "already using SSL" if tls_socket?
       raise "cannot start TLS without SSLContext" unless ssl_ctx
-      @sock = OpenSSL::SSL::SSLSocket.new(@sock, ssl_ctx)
+      tls = OpenSSL::SSL::SSLSocket.new(@sock.to_io, ssl_ctx)
+      tls.sync_close = true
+      tls.hostname = @host if tls.respond_to? :hostname=
+      pending_read = @sock.read_buffer
+      @sock = build_connection_io(tls)
+      @sock.adopt_read_buffer(pending_read)
       @reader = ResponseReader.new(self, @sock)
-      @sock.sync_close = true
-      @sock.hostname = @host if @sock.respond_to? :hostname=
-      ssl_socket_connect(@sock, open_timeout)
+      ssl_socket_connect(tls, open_timeout)
       @tls_connected = true
       if ssl_ctx.verify_mode != OpenSSL::SSL::VERIFY_NONE
-        @sock.post_connection_check(@host)
+        tls.post_connection_check(@host)
         @tls_verified = true
       end
     end
@@ -4222,6 +4291,7 @@ module Net
 end
 
 require_relative "imap/errors"
+require_relative "imap/connection_io"
 require_relative "imap/config"
 require_relative "imap/command_data"
 require_relative "imap/data_encoding"

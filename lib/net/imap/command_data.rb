@@ -37,24 +37,24 @@ module Net
       end
     end
 
-    def send_data(data, tag = nil)
+    def send_data(data, tag = nil, flush: true)
       case data
       when nil
         put_string("NIL")
       when String
-        send_string_data(data, tag)
+        send_string_data(data, tag, flush:)
       when Integer
-        send_number_data(data)
+        send_number_data(data, flush:)
       when Array
-        send_list_data(data, tag)
+        send_list_data(data, tag, flush:)
       when Time, DateTime
         send_time_data(data)
       when Date
         send_date_data(data)
       when Symbol
-        Flag[data].send_data(self, tag)
+        Flag[data].send_data(self, tag, flush:)
       else
-        data.send_data(self, tag)
+        data.send_data(self, tag, flush: flush)
       end
     end
 
@@ -68,15 +68,15 @@ module Net
     # * as a literal (may send non-synchronizing)
     #
     # NOTE: This does not validate that +str+ contains no +NULL+ bytes.
-    def send_string_data(str, tag = nil)
+    def send_string_data(str, tag = nil, flush: true)
       if str.empty?
         # same as send_quoted_string(str), but incompatible encoding is allowed
-        put_string('""')
+        put_string('""', flush:)
       elsif str.ascii_only? && !str.match?(ASTRING_SPECIALS)
         # valid +astring+ atom: non-empty, ASCII only, no ASTRING_SPECIALS
-        put_string(str)
+        put_string(str, flush:)
       elsif text_encodable?(str) && !str.match?(UNQUOTABLE_CHARS)
-        send_quoted_string(str)
+        send_quoted_string(str, flush:)
       else
         send_literal(str, tag)
       end
@@ -91,9 +91,11 @@ module Net
                           str.valid_encoding?)
     end
 
-    def send_quoted_string(str) = QuotedString.new(data: str).send_data(self)
+    def send_quoted_string(str, flush: true) = QuotedString.new(data: str).send_data(self, flush:)
 
-    def send_binary_literal(*, **) = send_literal(*, **, binary: true)
+    def send_binary_literal(*args, **options)
+      send_literal(*args, binary: true, **options)
+    end
 
     # `non_sync` is an optional tri-state flag:
     # * `true`  -> Force non-synchronizing `LITERAL+`/`LITERAL-` behavior.
@@ -101,7 +103,7 @@ module Net
     #   non-synchronizing literal, or literal is too large for LITERAL-.
     # * `false` -> Force normal synchronizing literal behavior.
     # * `nil`   -> (default) Currently behaves like `false` (will be dynamic).
-    def send_literal(str, tag = nil, binary: false, non_sync: nil)
+    def send_literal(str, tag = nil, binary: false, non_sync: nil, flush: true)
       bytesize = str.bytesize
       synchronize do
         if non_sync && !non_sync_literal_allowed?(bytesize)
@@ -113,9 +115,9 @@ module Net
         non_sync = non_sync_literal?(bytesize) if non_sync.nil?
         prefix = "~" if binary
         plus = "+" if non_sync
-        put_string("#{prefix}{#{bytesize}#{plus}}\r\n")
+        put_string("#{prefix}{#{bytesize}#{plus}}\r\n", flush: :now)
         if non_sync
-          put_string(str)
+          put_string(str, flush: false)
           return
         end
         @continued_command_tag = tag
@@ -123,7 +125,7 @@ module Net
         begin
           @continuation_request_arrival.wait
           reraise @continuation_request_exception || @exception
-          put_string(str)
+          put_string(str, flush: flush)
         ensure
           @continued_command_tag = nil
           @continuation_request_exception = nil
@@ -146,22 +148,22 @@ module Net
     def capable_literal_minus? = capable?("LITERAL-") || capable?("IMAP4rev2")
 
     # NOTE: +num+ should already be an Integer
-    def send_number_data(num)
-      put_string(Integer(num).to_s)
+    def send_number_data(num, flush: true)
+      put_string(Integer(num).to_s, flush:)
     end
 
-    def send_list_data(list, tag = nil)
-      put_string("(")
+    def send_list_data(list, tag = nil, flush: true)
+      put_string("(", flush: false)
       first = true
       list.each do |i|
         if first
           first = false
         else
-          put_string(" ")
+          put_string(" ", flush: false)
         end
-        send_data(i, tag)
+        send_data(i, tag, flush: false)
       end
-      put_string(")")
+        put_string(")", flush: flush)
     end
 
     def send_date_data(date) put_string Net::IMAP.encode_date(date) end
@@ -177,7 +179,7 @@ module Net
         data
       end
 
-      def send_data(imap, tag)
+      def send_data(imap, tag, **)
         raise NoMethodError, "#{self.class} must implement #{__method__}"
       end
 
@@ -224,7 +226,7 @@ module Net
 
       def ascii_only? = data.ascii_only?
 
-      def send_data(imap, tag = nil) = imap.__send__(:put_string, formatted)
+      def send_data(imap, tag = nil, **) = imap.__send__(:put_string, formatted)
     end
 
     # Represents IMAP +text+ data, which covers everything in the IMAP grammar,
@@ -249,7 +251,7 @@ module Net
         validate
       end
 
-      def send_data(imap, tag) = data.each do _1.send_data(imap, tag) end
+      def send_data(imap, tag, **) = data.each do _1.send_data(imap, tag, **) end
 
       def validate
         return unless data.last in RawText(data: text)
@@ -316,14 +318,14 @@ module Net
           and raise DataFormatError, "#{self.class} must not be empty"
       end
 
-      def send_data(imap, tag)
-        imap.__send__(:put_string, data.to_s)
+      def send_data(imap, tag, **options)
+        imap.__send__(:put_string, data.to_s, **options)
       end
     end
 
     class Flag < Atom # :nodoc:
-      def send_data(imap, tag)
-        imap.__send__(:put_string, "\\#{data}")
+      def send_data(imap, tag, **options)
+        imap.__send__(:put_string, "\\#{data}", **options)
       end
     end
 
@@ -359,16 +361,16 @@ module Net
         end
       end
 
-      def send_data(imap, tag)
-        imap.__send__(:send_literal, data, tag, non_sync:)
+      def send_data(imap, tag, **options)
+        imap.__send__(:send_literal, data, tag, **options)
       end
     end
 
     class Literal8 < Literal # :nodoc:
       def validate = nil # all bytes are okay
 
-      def send_data(imap, tag)
-        imap.__send__(:send_binary_literal, data, tag, non_sync:)
+      def send_data(imap, tag, **options)
+        imap.__send__(:send_binary_literal, data, tag, **options)
       end
     end
 
@@ -399,15 +401,15 @@ module Net
 
       def formatted = "%d:%d" % data.minmax
 
-      def send_data(imap, tag)
-        imap.__send__(:put_string, formatted)
+      def send_data(imap, tag, **options)
+        imap.__send__(:put_string, formatted, **options)
       end
     end
 
     class ClientID < CommandData # :nodoc:
 
-      def send_data(imap, tag)
-        imap.__send__(:send_data, format_internal(data), tag)
+      def send_data(imap, tag, **options)
+        imap.__send__(:send_data, format_internal(data), tag, **options)
       end
 
       def validate
