@@ -393,6 +393,9 @@ module Net
   #   <em>Requires the +STARTTLS+ capability.</em>
   #
   #   <em>*NOTE:* Connecting to the implicit TLS port should be preferred.</em>
+  # - #compress: Enables +DEFLATE+ compression for the connection.
+  #
+  #   <em>Requires the +COMPRESS=DEFLATE+ capability.</em>
   # - #logout: Tells the server to end the session.  Enters the +logout+ state.
   # - #logout!: Calls #logout then #disconnect, converting most errors into
   #   warnings.
@@ -462,6 +465,7 @@ module Net
   # The following commands are defined either by
   # the [IMAP4rev1[https://www.rfc-editor.org/rfc/rfc3501]] base specification, or
   # by one of the following extensions:
+  # [COMPRESS=DEFLATE[https://www.rfc-editor.org/rfc/rfc4978]],
   # [IDLE[https://www.rfc-editor.org/rfc/rfc2177]],
   # [NAMESPACE[https://www.rfc-editor.org/rfc/rfc2342]],
   # [UNSELECT[https://www.rfc-editor.org/rfc/rfc3691]],
@@ -508,6 +512,7 @@ module Net
   # in the +authenticated+ state:
   #
   # - #enable: Enables backwards incompatible server extensions.
+  # - #compress: Compresses subsequent protocol data with +DEFLATE+.
   #   <em>Requires the +ENABLE+ or +IMAP4rev2+ capability.</em>
   # - #select:  Open a mailbox and enter the +selected+ state.
   # - #examine: Open a mailbox read-only, and enter the +selected+ state.
@@ -948,6 +953,7 @@ module Net
 
     dir = File.expand_path("imap", __dir__)
     autoload :ConnectionState,        "#{dir}/connection_state"
+    autoload :DeflateSocket,          "#{dir}/deflate_socket"
     autoload :ResponseReader,         "#{dir}/response_reader"
     autoload :SASL,                   "#{dir}/sasl"
     autoload :SASLAdapter,            "#{dir}/sasl_adapter"
@@ -1273,8 +1279,9 @@ module Net
 
       # Connection
       @sock = tcp_socket(@host, @port)
-      @reader = ResponseReader.new(self, @sock)
       start_tls_session if ssl_ctx
+      @sock = DeflateSocket.new(@sock)
+      @reader = ResponseReader.new(self, @sock)
       start_imap_connection
     end
 
@@ -1342,7 +1349,15 @@ module Net
     # This only indicates that TLS negotiation has started.
     #
     # See #tls_verified?
-    def tls_socket?; @sock.kind_of?(OpenSSL::SSL::SSLSocket) end
+    def tls_socket?
+      @sock.kind_of?(OpenSSL::SSL::SSLSocket) ||
+        (@sock.respond_to?(:tls_socket?) && @sock.tls_socket?)
+    end
+
+    # Returns +true+ when the connection transport is compressed.
+    def compressed?
+      synchronize { @sock.compressed? }
+    end
 
     # Disconnects from the server.
     #
@@ -1636,6 +1651,55 @@ module Net
               ]
       end
       ok
+    end
+
+    # Sends a {COMPRESS command [RFC4978]}[https://www.rfc-editor.org/rfc/rfc4978]
+    # to enable DEFLATE compression for all subsequent IMAP data.
+    #
+    # Compression may only be enabled after authentication and before the
+    # connection enters the logout state.  If the server rejects the command,
+    # the connection remains uncompressed and usable.  Enabling compression a
+    # second time raises before any command is sent.
+    #
+    # ==== Capability
+    # The server's capabilities must include +COMPRESS=DEFLATE+.
+    def compress(algorithm = "DEFLATE")
+      algorithm = algorithm.to_str.upcase
+      synchronize do
+        if disconnected?
+          raise Error, "connection closed"
+        elsif @sock.compressed?
+          raise Error, "compression is already enabled"
+        elsif !connection_state.authenticated? && !connection_state.selected?
+          raise Error, "COMPRESS is not allowed in the #{connection_state.name} state"
+        elsif algorithm != "DEFLATE"
+          raise ArgumentError, "unsupported compression algorithm: #{algorithm}"
+        elsif !capable?("COMPRESS=DEFLATE")
+          raise Error, "server does not support COMPRESS=DEFLATE"
+        end
+
+        handled = false
+        error = nil
+        ok = send_command("COMPRESS", Atom["DEFLATE"]) do |resp|
+          if resp.kind_of?(TaggedResponse) && resp.name == "OK"
+            @sock.start_deflate!
+            @capabilities = @capabilities&.reject { _1.casecmp?("COMPRESS=DEFLATE") }&.freeze
+            handled = true
+          end
+        end
+        if error
+          disconnect
+          reraise error
+        end
+        unless handled
+          disconnect
+          raise InvalidResponseError,
+                "COMPRESS handler was bypassed, although server responded %p" % [
+                  ok.raw_data.chomp
+                ]
+        end
+        ok
+      end
     end
 
     # :call-seq:
@@ -4153,16 +4217,22 @@ module Net
 
     def start_tls_session
       raise "SSL extension not installed" unless defined?(OpenSSL::SSL)
-      raise "already using SSL" if @sock.kind_of?(OpenSSL::SSL::SSLSocket)
+      raise "already using SSL" if tls_socket?
       raise "cannot start TLS without SSLContext" unless ssl_ctx
-      @sock = OpenSSL::SSL::SSLSocket.new(@sock, ssl_ctx)
-      @reader = ResponseReader.new(self, @sock)
-      @sock.sync_close = true
-      @sock.hostname = @host if @sock.respond_to? :hostname=
-      ssl_socket_connect(@sock, open_timeout)
+      transport = @sock
+      transport = @sock.io if @sock.is_a?(DeflateSocket)
+      tls = OpenSSL::SSL::SSLSocket.new(transport, ssl_ctx)
+      tls.sync_close = true
+      tls.hostname = @host if tls.respond_to? :hostname=
+      ssl_socket_connect(tls, open_timeout)
+      if @sock.is_a?(DeflateSocket)
+        @sock.replace_io!(tls)
+      else
+        @sock = DeflateSocket.new(tls)
+      end
       @tls_connected = true
-      if ssl_ctx.verify_mode != OpenSSL::SSL::VERIFY_NONE
-        @sock.post_connection_check(@host)
+      if tls.ctx.verify_mode != OpenSSL::SSL::VERIFY_NONE
+        tls.post_connection_check(@host)
         @tls_verified = true
       end
     end

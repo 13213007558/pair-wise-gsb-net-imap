@@ -61,8 +61,8 @@ module Net
       end
 
       def read_literal
-        literal = String.new(capacity: literal_size)
-        buff << (@sock.read(literal_size, literal) or throw :eof)
+        literal_buffer = String.new(capacity: literal_size)
+        buff << (@sock.read(literal_size, literal_buffer) or throw :eof)
       ensure
         @literal_size = nil
       end
