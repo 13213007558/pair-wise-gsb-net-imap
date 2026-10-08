@@ -1950,6 +1950,9 @@ module Net
       #   resp-code-copy   = "COPYUID" SP nz-number SP uid-set SP uid-set
       #   resp-text-code   =/ resp-code-apnd / resp-code-copy / "UIDNOTSTICKY"
       #
+      # RFC4469 (CATENATE):
+      #   resp-text-code   =/ "BADURL" / "TOOBIG"
+      #
       # RFC7162 (CONDSTORE):
       #   resp-text-code   =/ "HIGHESTMODSEQ" SP mod-sequence-value /
       #                       "NOMODSEQ" /
@@ -1980,7 +1983,8 @@ module Net
             "EXPIRED", "PRIVACYREQUIRED", "CONTACTADMIN", "NOPERM", "INUSE",
             "EXPUNGEISSUED", "CORRUPTION", "SERVERBUG", "CLIENTBUG", "CANNOT",
             "LIMIT", "OVERQUOTA", "ALREADYEXISTS", "NONEXISTENT", "CLOSED",
-            "NOTSAVED", "UIDNOTSTICKY", "UNKNOWN-CTE", "HASCHILDREN"
+            "NOTSAVED", "UIDNOTSTICKY", "UNKNOWN-CTE", "HASCHILDREN",
+            "BADURL", "TOOBIG"
           when "NOMODSEQ"           then nil                       # CONDSTORE
           when "HIGHESTMODSEQ"      then SP!; mod_sequence_value   # CONDSTORE
           when "MODIFIED"           then SP!; sequence_set         # CONDSTORE

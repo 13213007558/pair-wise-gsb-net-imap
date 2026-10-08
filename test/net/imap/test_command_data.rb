@@ -13,6 +13,9 @@ class CommandDataTest < Net::IMAP::TestCase
   QuotedString = Net::IMAP::QuotedString
   Literal = Net::IMAP::Literal
   Literal8 = Net::IMAP::Literal8
+  CatenateURL = Net::IMAP::CatenateURL
+  LazyLiteral = Net::IMAP::LazyLiteral
+  CatenateData = Net::IMAP::CatenateData
   RawText = Net::IMAP::RawText
   RawData = Net::IMAP::RawData
 
@@ -158,6 +161,56 @@ class CommandDataTest < Net::IMAP::TestCase
     ], imap.output
   end
 
+  test "CatenateURL" do
+    imap.send_data CatenateURL["imap://imap.example.com/INBOX/;uid=24356"]
+    assert_equal [
+      Output.put_string("URL "),
+      Output.send_string_data("imap://imap.example.com/INBOX/;uid=24356", TAG),
+    ], imap.output
+
+    assert_raise(DataFormatError) { CatenateURL["with\0null"] }
+    assert_raise(DataFormatError) { CatenateURL["with\r\nCRLF"] }
+  end
+
+  test "LazyLiteral reads its source lazily, only when sent" do
+    reads = 0
+    source = Object.new
+    source.define_singleton_method(:read) { reads += 1; "read once" }
+    lazy = LazyLiteral[source]
+    assert_equal 0, reads
+
+    imap.send_data lazy
+    assert_equal 1, reads
+    assert_equal [Output.send_literal("read once", TAG)], imap.output
+
+    imap.clear
+    binary = Object.new
+    def binary.read = "has \0 null"
+    imap.send_data LazyLiteral[binary]
+    assert_equal [Output.send_binary_literal("has \0 null", TAG)], imap.output
+
+    assert_raise(TypeError) { LazyLiteral[42] }
+  end
+
+  test "CatenateData" do
+    source = Object.new
+    def source.read = "from io"
+    imap.send_data CatenateData[
+      [CatenateURL["imap://example.com/INBOX/;uid=1"], "text", source]
+    ]
+    assert_equal [
+      Output.put_string("URL "),
+      Output.send_string_data("imap://example.com/INBOX/;uid=1", TAG),
+      Output.put_string(" "),
+      Output.send_literal("text", TAG),
+      Output.put_string(" "),
+      Output.send_literal("from io", TAG),
+    ], imap.output
+
+    assert_raise(DataFormatError) { CatenateData[[]] }
+    assert_raise(TypeError)         { CatenateData[[42]] }
+  end
+
   class StringFormatterTest < Net::IMAP::TestCase
     include Net::IMAP::StringFormatter
 
@@ -174,6 +227,19 @@ class CommandDataTest < Net::IMAP::TestCase
       assert_kind_of Literal8, literal_or_literal8("has NULL \0")
       assert_kind_of Literal,  literal_or_literal8(Literal["foo"])
       assert_kind_of Literal8, literal_or_literal8(Literal8["foo"])
+    end
+
+    test "message_data" do
+      io_like = Object.new
+      def io_like.read = "message"
+      assert_kind_of Literal,      message_data("simple")
+      assert_kind_of Literal8,     message_data("has NULL \0")
+      assert_kind_of Literal,      message_data(Literal["foo"])
+      assert_kind_of CatenateData, message_data(["part1", "part2"])
+      assert_kind_of CatenateData, message_data(CatenateData[["part"]])
+      assert_kind_of CatenateData, message_data(CatenateURL["imap://x/y"])
+      assert_kind_of LazyLiteral,  message_data(io_like)
+      assert_raise(TypeError) { message_data(42) }
     end
   end
 

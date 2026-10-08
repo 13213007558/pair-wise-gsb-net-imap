@@ -2271,11 +2271,41 @@ module Net
     #   hello world
     #   EOF
     #
+    # +message+ may also be any IO-like object (anything that responds to
+    # +read+), which is read exactly once, as the command is being sent.
+    #
+    # When +message+ is an Array, its elements are composed into a single
+    # message using the +CATENATE+ extension
+    # [RFC4469[https://www.rfc-editor.org/rfc/rfc4469.html]].  Each element
+    # may be a String, an IO-like object, or a CatenateURL (which refers to
+    # a message or message part that already exists on the server, so it
+    # does not need to be downloaded and uploaded again):
+    #
+    #   imap.append("Sent", [
+    #     Net::IMAP::CatenateURL["imap://imap.example.com/INBOX/;uid=24356"],
+    #     "X-Comment: forwarded by catenate\r\n",
+    #     File.open("attachment.eml", "rb"),
+    #   ])
+    #
+    # The elements are sent in order, and each IO-like element is read
+    # lazily: it is only read after the server has accepted every preceding
+    # element.  When the server rejects the command partway through (for
+    # instance, with a +BADURL+ or +TOOBIG+ response code), the remaining
+    # elements are never read, and the connection remains usable for
+    # subsequent commands.
+    #
     # A Net::IMAP::NoResponseError is raised if the mailbox does
     # not exist (it is not created automatically), or if the flags,
     # date_time, or message arguments contain errors.
     #
     # ==== Capabilities
+    #
+    # The server's capabilities must include +CATENATE+
+    # [RFC4469[https://www.rfc-editor.org/rfc/rfc4469.html]] to send
+    # +message+ as an Array of parts.  Note that CatenateURL elements also
+    # require the server's support for the URL scheme that is used; for
+    # example, +imap+ URLs require +URLAUTH+
+    # [RFC4467[https://www.rfc-editor.org/rfc/rfc4467.html]].
     #
     # If +BINARY+ [RFC3516[https://www.rfc-editor.org/rfc/rfc3516.html]] is
     # supported by the server, +message+ may contain +NULL+ characters and
@@ -2292,7 +2322,7 @@ module Net
     # TODO: add MULTIAPPEND support
     #++
     def append(mailbox, message, flags = nil, date_time = nil)
-      message = StringFormatter.literal_or_literal8(message, name: "message")
+      message = StringFormatter.message_data(message)
       args = []
       args.push(flags)     if flags
       args.push(date_time) if date_time

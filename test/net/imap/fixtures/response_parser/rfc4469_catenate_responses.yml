@@ -1,0 +1,25 @@
+---
+:tests: 
+  "RFC4469 CATENATE BADURL response code":
+    :response: "A003 NO [BADURL] invalid URL in catenate\r\n"
+    :expected: !ruby/struct:Net::IMAP::TaggedResponse
+      tag: A003
+      name: 'NO'
+      data: !ruby/struct:Net::IMAP::ResponseText
+        code: !ruby/struct:Net::IMAP::ResponseCode
+          name: BADURL
+          data: 
+        text: invalid URL in catenate
+      raw_data: "A003 NO [BADURL] invalid URL in catenate\r\n"
+
+  "RFC4469 CATENATE TOOBIG response code":
+    :response: "A003 NO [TOOBIG] resulting message is too big\r\n"
+    :expected: !ruby/struct:Net::IMAP::TaggedResponse
+      tag: A003
+      name: 'NO'
+      data: !ruby/struct:Net::IMAP::ResponseText
+        code: !ruby/struct:Net::IMAP::ResponseCode
+          name: TOOBIG
+          data: 
+        text: resulting message is too big
+      raw_data: "A003 NO [TOOBIG] resulting message is too big\r\n"

@@ -372,6 +372,99 @@ module Net
       end
     end
 
+    # Represents an IMAP +append-url+, used by the +CATENATE+ extension
+    # [RFC4469[https://www.rfc-editor.org/rfc/rfc4469.html]] to compose a
+    # message from content that already exists on the server.  See #append.
+    class CatenateURL < CommandData
+      def initialize(data:)
+        data = String(data.to_str)
+        super(data: -data)
+        validate
+      end
+
+      def validate
+        if data.match?(/[\0\r\n]/)
+          raise DataFormatError, "URL must not contain NULL, CR, or LF bytes"
+        end
+      end
+
+      def send_data(imap, tag)
+        imap.__send__(:put_string, "URL ")
+        imap.__send__(:send_string_data, data, tag)
+      end
+    end
+
+    # Wraps an IO-like message source (anything that responds to +read+) so
+    # that it is read lazily: exactly once, only as the command is being
+    # sent, and only after the server has accepted every preceding part of
+    # the command.  When the server rejects the command before this part is
+    # reached, the source is never read.
+    class LazyLiteral < CommandData
+      def initialize(data:)
+        data.respond_to?(:read) or
+          raise TypeError, "expected an IO-like object, got #{data.class}"
+        super
+      end
+
+      def send_data(imap, tag)
+        StringFormatter.literal_or_literal8(read_source).send_data(imap, tag)
+      end
+
+      private
+
+      def read_source
+        source = data.read
+        source.is_a?(String) or
+          raise DataFormatError,
+                "message source must return a String, got #{source.class}"
+        source
+      end
+    end
+
+    # Composes a single message from multiple parts, using the +CATENATE+
+    # extension [RFC4469[https://www.rfc-editor.org/rfc/rfc4469.html]].
+    # See #append.
+    #
+    # Each part may be:
+    # * a String, Literal, or Literal8, sent as a literal
+    # * an IO-like object (responds to +read+), wrapped in a LazyLiteral
+    # * a CatenateURL, referring to content that already exists on the server
+    class CatenateData < CommandData
+      def initialize(data:)
+        parts = Array(data).map { |part| coerce_part(part) }
+        super(data: parts.freeze)
+        validate
+      end
+
+      def validate
+        if data.empty?
+          raise DataFormatError, "CATENATE requires at least one message part"
+        end
+      end
+
+      def send_data(imap, tag)
+        first = true
+        data.each do |part|
+          if first
+            first = false
+          else
+            imap.__send__(:put_string, " ")
+          end
+          part.send_data(imap, tag)
+        end
+      end
+
+      private
+
+      def coerce_part(part)
+        case part
+        when CatenateURL, Literal then part
+        when String then StringFormatter.literal_or_literal8(part)
+        else LazyLiteral.new(data: part)
+        end
+      end
+    end
+
     class PartialRange < CommandData # :nodoc:
       uint32_max = 2**32 - 1
       POS_RANGE = 1..uint32_max
@@ -447,6 +540,22 @@ module Net
           or raise TypeError, "expected #{name} to be String, got #{input.class}"
         type = data.include?("\0") ? Literal8 : Literal
         type.new(data:)
+      end
+
+      # Coerces an #append +message+ into command data: a single literal, a
+      # lazily-read source, or a CatenateData composition of message parts.
+      def message_data(message, name: "message")
+        case message
+        when Literal, CatenateData then message
+        when CatenateURL then CatenateData.new(data: [message])
+        when Array then CatenateData.new(data: message)
+        else
+          if (string = String.try_convert(message))
+            literal_or_literal8(string, name:)
+          else
+            LazyLiteral.new(data: message)
+          end
+        end
       end
 
       # Allows symbols in addition to strings

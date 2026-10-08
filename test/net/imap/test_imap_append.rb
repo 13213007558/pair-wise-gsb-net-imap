@@ -122,4 +122,129 @@ class IMAPAppendTest < Net::IMAP::TestCase
     end
   end
 
+  # An IO-like message source that can only be read once.
+  class ReadOnceSource
+    attr_reader :read_count
+
+    def initialize(content)
+      @content    = content
+      @read_count = 0
+    end
+
+    def read
+      @read_count += 1
+      raise IOError, "read-once source was read again" if @read_count > 1
+      @content
+    end
+  end
+
+  test "#append with CATENATE URLs around a read-once text source" do
+    with_in_memory_fake_server(with_extensions: %i[CATENATE UIDPLUS]) do |server, imap|
+      server.on("APPEND") do |resp|
+        resp.done_ok "APPEND completed", code: "APPENDUID 38505 3955"
+      end
+
+      content = "X-Comment: forwarded\r\n"
+      text = ReadOnceSource.new(content)
+      response = imap.append("INBOX", [
+        Net::IMAP::CatenateURL["imap://imap.example.com/INBOX/;uid=24356"],
+        text,
+        Net::IMAP::CatenateURL["imap://imap.example.com/INBOX/;uid=24357"],
+      ])
+
+      assert_equal 1, text.read_count
+      assert_equal "INBOX " \
+        "URL imap://imap.example.com/INBOX/;uid=24356 " \
+        "{#{content.bytesize}}\r\n#{content} " \
+        "URL imap://imap.example.com/INBOX/;uid=24357",
+        server.commands.pop.args
+      code = response.data.code
+      assert_equal "APPENDUID", code.name
+      assert_equal 38505, code.data.uidvalidity
+      assert_equal [3955], code.data.assigned_uids.numbers
+    end
+  end
+
+  test "#append with CATENATE empty text part" do
+    with_in_memory_fake_server(with_extensions: %i[CATENATE]) do |server, imap|
+      server.on("APPEND", &:done_ok)
+
+      imap.append("INBOX", [
+        Net::IMAP::CatenateURL["imap://imap.example.com/INBOX/;uid=24356"],
+        "",
+        Net::IMAP::CatenateURL["imap://imap.example.com/INBOX/;uid=24357"],
+      ])
+
+      assert_equal "INBOX " \
+        "URL imap://imap.example.com/INBOX/;uid=24356 {0}\r\n " \
+        "URL imap://imap.example.com/INBOX/;uid=24357",
+        server.commands.pop.args
+    end
+  end
+
+  test "#append CATENATE rejection skips unread sources and keeps connection" do
+    with_in_memory_fake_server(with_extensions: %i[CATENATE]) do |server, imap|
+      server.literal_acceptor = ->(_buf, _size) { false }
+      server.on("APPEND", &:done_ok)
+
+      unread = ReadOnceSource.new("must never be read")
+      error = assert_raise(Net::IMAP::NoResponseError) do
+        imap.append("INBOX", [
+          Net::IMAP::CatenateURL["imap://imap.example.com/INBOX/;uid=24356"],
+          "rejected text",
+          unread,
+        ])
+      end
+      assert_match(/literal rejected/, error.message)
+
+      assert_equal 0, unread.read_count
+      assert_equal "OK", imap.noop.name
+      assert_equal "NOOP", server.commands.pop.name
+    end
+  end
+
+  test "#append CATENATE BADURL and TOOBIG errors are distinct" do
+    with_in_memory_fake_server(with_extensions: %i[CATENATE]) do |server, imap|
+      server.on("APPEND") { |resp| resp.fail_no "bad url", code: "BADURL" }
+      error = assert_raise(Net::IMAP::NoResponseError) do
+        imap.append("INBOX", [Net::IMAP::CatenateURL["imap://x/y"]])
+      end
+      assert_equal "BADURL", error.response.data.code.name
+    end
+
+    with_in_memory_fake_server(with_extensions: %i[CATENATE]) do |server, imap|
+      server.on("APPEND") { |resp| resp.fail_no "too big", code: "TOOBIG" }
+      error = assert_raise(Net::IMAP::NoResponseError) do
+        imap.append("INBOX", [Net::IMAP::CatenateURL["imap://x/y"], "text"])
+      end
+      assert_equal "TOOBIG", error.response.data.code.name
+    end
+  end
+
+  test "#append CATENATE connection interruption is distinct from NO" do
+    with_in_memory_fake_server(with_extensions: %i[CATENATE]) do |server, imap|
+      server.on("APPEND") { |_resp| throw :eof }
+      assert_raise(Net::IMAP::ByeResponseError) do
+        imap.append("INBOX", [Net::IMAP::CatenateURL["imap://x/y"]])
+      end
+    end
+  end
+
+  test "#append CATENATE validates parts without reading sources" do
+    with_in_memory_fake_server(with_extensions: %i[CATENATE]) do |server, imap|
+      unread = ReadOnceSource.new("must never be read")
+      assert_raise(Net::IMAP::DataFormatError) do
+        imap.append("INBOX", [])
+      end
+      assert_raise(TypeError) do
+        imap.append("INBOX", [unread, 42])
+      end
+      assert_raise(Net::IMAP::DataFormatError) do
+        imap.append("INBOX", [Net::IMAP::CatenateURL["imap://x/\r\ny"]])
+      end
+      assert_equal 0, unread.read_count
+      assert_empty server.commands
+    end
+  end
+
 end

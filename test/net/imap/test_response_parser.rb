@@ -81,6 +81,9 @@ class ResponseParserTest < Net::IMAP::TestCase
   # RFC 4315: UIDPLUS extension, APPENDUID and COPYUID response codes
   generate_tests_from fixture_file: "uidplus_extension.yml"
 
+  # RFC 4469: CATENATE extension, BADURL and TOOBIG response codes
+  generate_tests_from fixture_file: "rfc4469_catenate_responses.yml"
+
   # RFC 5256: THREAD response
   generate_tests_from fixture_file: "thread_responses.yml"
 
