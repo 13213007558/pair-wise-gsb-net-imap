@@ -1980,7 +1980,8 @@ module Net
             "EXPIRED", "PRIVACYREQUIRED", "CONTACTADMIN", "NOPERM", "INUSE",
             "EXPUNGEISSUED", "CORRUPTION", "SERVERBUG", "CLIENTBUG", "CANNOT",
             "LIMIT", "OVERQUOTA", "ALREADYEXISTS", "NONEXISTENT", "CLOSED",
-            "NOTSAVED", "UIDNOTSTICKY", "UNKNOWN-CTE", "HASCHILDREN"
+            "NOTSAVED", "UIDNOTSTICKY", "UNKNOWN-CTE", "HASCHILDREN",
+            "BADURL", "TOOBIG"
           when "NOMODSEQ"           then nil                       # CONDSTORE
           when "HIGHESTMODSEQ"      then SP!; mod_sequence_value   # CONDSTORE
           when "MODIFIED"           then SP!; sequence_set         # CONDSTORE

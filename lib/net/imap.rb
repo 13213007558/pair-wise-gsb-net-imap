@@ -865,6 +865,11 @@ module Net
   #   Crispin, M., "Internet Message Access Protocol (\IMAP) - UIDPLUS
   #   extension", RFC 4315, DOI 10.17487/RFC4315, December 2005,
   #   <https://www.rfc-editor.org/info/rfc4315>.
+  # [CATENATE[https://www.rfc-editor.org/rfc/rfc4469]]::
+  #   Crispin, M., "Internet Message Access Protocol (\IMAP) CATENATE
+  #   Extension and Content Hash Addresses", RFC 4469,
+  #   DOI 10.17487/RFC4469, April 2006,
+  #   <https://www.rfc-editor.org/info/rfc4469>.
   # [SORT[https://www.rfc-editor.org/rfc/rfc5256]]::
   #   Crispin, M. and K. Murchison, "Internet Message Access Protocol - SORT and
   #   THREAD Extensions", RFC 5256, DOI 10.17487/RFC5256, June 2008,
@@ -2288,11 +2293,21 @@ module Net
     # This will report the UIDVALIDITY of the destination mailbox and the
     # assigned UID of the appended message.
     #
-    #--
-    # TODO: add MULTIAPPEND support
-    #++
-    def append(mailbox, message, flags = nil, date_time = nil)
-      message = StringFormatter.literal_or_literal8(message, name: "message")
+    # If +CATENATE+ [RFC4469[https://www.rfc-editor.org/rfc/rfc4469.html]] is
+    # supported, +catenate+ may be an array of sources to combine on the
+    # server.  Each source is a hash containing either <tt>url:</tt> for a
+    # remote IMAP URL or <tt>text:</tt> for a String or readable local source.
+    # Readable text sources must expose their size with +bytesize+ or +size+
+    # unless it is passed with the +length+, +bytesize+, or +size+ option.
+    def append(mailbox, message = nil, flags = nil, date_time = nil, catenate: nil)
+      if catenate
+        raise ArgumentError, "message and catenate cannot both be provided" if message
+        message = Catenate.coerce(catenate)
+      elsif message.is_a?(Catenate) || message.is_a?(Array)
+        message = Catenate.coerce(message)
+      else
+        message = StringFormatter.literal_or_literal8(message, name: "message")
+      end
       args = []
       args.push(flags)     if flags
       args.push(date_time) if date_time

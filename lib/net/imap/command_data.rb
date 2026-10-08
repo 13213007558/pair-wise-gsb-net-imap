@@ -102,33 +102,67 @@ module Net
     # * `false` -> Force normal synchronizing literal behavior.
     # * `nil`   -> (default) Currently behaves like `false` (will be dynamic).
     def send_literal(str, tag = nil, binary: false, non_sync: nil)
-      bytesize = str.bytesize
       synchronize do
-        if non_sync && !non_sync_literal_allowed?(bytesize)
-          # TODO: check in Printer, so we don't need to close the connection.
-          @sock.close
-          raise DataFormatError, "Connection closed: " \
-            "Cannot send non-synchronizing literal without known server support"
-        end
-        non_sync = non_sync_literal?(bytesize) if non_sync.nil?
-        prefix = "~" if binary
-        plus = "+" if non_sync
-        put_string("#{prefix}{#{bytesize}#{plus}}\r\n")
-        if non_sync
-          put_string(str)
-          return
-        end
-        @continued_command_tag = tag
-        @continuation_request_exception = nil
-        begin
-          @continuation_request_arrival.wait
-          reraise @continuation_request_exception || @exception
-          put_string(str)
-        ensure
-          @continued_command_tag = nil
-          @continuation_request_exception = nil
-        end
+        send_literal_prefix(str.bytesize, tag, binary:, non_sync:)
+        copy_literal_source(str, str.bytesize)
       end
+    end
+
+    def send_stream_literal(source, bytesize, tag = nil,
+                            binary: false, non_sync: nil)
+      synchronize do
+        send_literal_prefix(bytesize, tag, binary:, non_sync:)
+        copy_literal_source(source, bytesize)
+      end
+    end
+
+    def send_stream_binary_literal(*, **) = send_stream_literal(*, **, binary: true)
+
+    def send_literal_prefix(bytesize, tag, binary:, non_sync:)
+      if non_sync && !non_sync_literal_allowed?(bytesize)
+        # TODO: check in Printer, so we don't need to close the connection.
+        @sock.close
+        raise DataFormatError, "Connection closed: " \
+          "Cannot send non-synchronizing literal without known server support"
+      end
+      non_sync = non_sync_literal?(bytesize) if non_sync.nil?
+      prefix = "~" if binary
+      plus = "+" if non_sync
+      put_string("#{prefix}{#{bytesize}#{plus}}\r\n")
+      return if non_sync
+      @continued_command_tag = tag
+      @continuation_request_exception = nil
+      begin
+        @continuation_request_arrival.wait
+        reraise @continuation_request_exception || @exception
+      ensure
+        @continued_command_tag = nil
+        @continuation_request_exception = nil
+      end
+    end
+
+    def copy_literal_source(source, bytesize)
+      return put_string(source) if source.is_a?(String)
+      remaining = bytesize
+      while remaining > 0
+        chunk = read_literal_chunk(source, remaining)
+        unless chunk.is_a?(String)
+          @sock.close
+          raise DataFormatError, "literal source must return a String"
+        end
+        if chunk.empty? || chunk.b.bytesize > remaining
+          @sock.close
+          raise DataFormatError, "literal source returned invalid chunk size"
+        end
+        put_string(chunk.b)
+        remaining -= chunk.bytesize
+      end
+    end
+
+    def read_literal_chunk(source, bytesize)
+      source.read(bytesize)
+    rescue ArgumentError
+      source.read
     end
 
     def non_sync_literal?(bytesize)
@@ -369,6 +403,134 @@ module Net
 
       def send_data(imap, tag)
         imap.__send__(:send_binary_literal, data, tag, non_sync:)
+      end
+    end
+
+    class Catenate < CommandData # :nodoc:
+      def self.coerce(sources)
+        return sources if sources.is_a?(self)
+        sources = Array.try_convert(sources) or
+          raise TypeError, "expected catenate sources to be an Array"
+        new(sources.map { Source.coerce(_1) })
+      end
+
+      def initialize(data)
+        super
+        validate
+      end
+
+      def validate
+        data.empty? and raise ArgumentError, "catenate sources must not be empty"
+      end
+
+      def send_data(imap, tag)
+        imap.__send__(:put_string, "CATENATE (")
+        data.each_with_index do |source, index|
+          imap.__send__(:put_string, " ") unless index.zero?
+          source.send_data(imap, tag)
+        end
+        imap.__send__(:put_string, ")")
+      end
+
+      class Source < CommandData
+        def self.coerce(source)
+          case source
+          when self then source
+          when Hash then coerce_hash(source)
+          else
+            raise TypeError, "expected catenate source to be a Hash, got #{source.class}"
+          end
+        end
+
+        def self.coerce_hash(source)
+          url  = source.key?(:url)
+          text = source.key?(:text)
+          if url == text
+            raise ArgumentError, "catenate source must specify either :url or :text"
+          elsif url
+            Url.new(data: source.fetch(:url))
+          else
+            Text.new(
+              data:     source.fetch(:text),
+              length:   catenate_text_length(source),
+              binary:   source.fetch(:binary, false),
+            )
+          end
+        end
+
+        def self.catenate_text_length(source)
+          key = %i[length bytesize size].find { source.key?(_1) }
+          source[key] if key
+        end
+
+        private_class_method :coerce_hash, :catenate_text_length
+      end
+
+      class Url < CommandData # :nodoc:
+        def initialize(data:)
+          super(data: String(data))
+        end
+
+        def validate
+          super
+          unless data.ascii_only? && !data.empty? && !data.match?(/[\0\]\r\n]/n)
+            raise DataFormatError, "invalid CATENATE url"
+          end
+        end
+
+        def send_data(imap, tag)
+          imap.__send__(:put_string, "URL [#{data}]")
+        end
+      end
+      const_set(:URL, Url)
+
+      class Text < Source
+        attr_reader :bytesize
+
+        def initialize(data:, length: nil, binary: false)
+          @source, source_length = prepare_source(data, length)
+          @binary = binary
+          @bytesize = Integer(length.nil? ? source_length : length)
+          super(data: @source)
+          validate
+        end
+
+        def binary? = @binary
+
+        def send_data(imap, tag)
+          imap.send(:put_string, "TEXT ")
+          method = binary? ? :send_stream_binary_literal : :send_stream_literal
+          imap.send(method, data, bytesize, tag, non_sync: false)
+        end
+
+        private
+
+        def prepare_source(source, length)
+          if source.is_a?(String)
+            [source, source.bytesize]
+          elsif source.respond_to?(:read)
+            unless length
+              source_length = source.respond_to?(:bytesize) ? :bytesize : :size
+              if source.respond_to?(source_length)
+                length = source.public_send(source_length)
+              else
+                raise ArgumentError, "catenate text source length is required"
+              end
+            end
+            [source, Integer(length)]
+          else
+            raise TypeError, "expected catenate text source to be String or readable"
+          end
+        end
+
+        def validate
+          unless bytesize.is_a?(Integer) && bytesize >= 0
+            raise ArgumentError, "catenate text source length must be a non-negative Integer"
+          end
+          if data.is_a?(String) && data.bytesize != bytesize
+            raise ArgumentError, "catenate text source length does not match string bytesize"
+          end
+        end
       end
     end
 
